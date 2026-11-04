@@ -2111,6 +2111,81 @@ class WorkerProc:
             logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)
         return [s for s in statuses if s is not None]
 
+    def _is_stage_leader(self) -> bool:
+        """Check if this worker is the leader of its PP stage.
+
+        PP stage leader is defined as: tp=0, sp=0, cfg=0, dp=1.
+        PP configuration validation already requires dp=1, so we only
+        need to check the other dimensions.
+        """
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_classifier_free_guidance_rank,
+            get_data_parallel_rank,
+            get_sequence_parallel_rank,
+        )
+
+        return (
+            get_sequence_parallel_rank() == 0
+            and get_classifier_free_guidance_rank() == 0
+            and get_tensor_model_parallel_rank() == 0
+            and get_data_parallel_rank() == 1
+        )
+
+    def _execute_role_rpc(self, rpc_request: dict) -> None:
+        """Execute a role-based RPC and send independent replies per role.
+
+        Two-phase Step-PP protocol: first stage leader replies "entry" (PP0 done),
+        last stage leader replies "result" (full step done), middle stages execute
+        but don't reply. Errors are fanned out to all reply_roles.
+        """
+        from vllm_omni.diffusion.data import RpcReply
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_pipeline_parallel_rank,
+            get_pipeline_parallel_world_size,
+        )
+        from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+        reply_roles = rpc_request.get("reply_roles", {})
+        if not reply_roles:
+            logger.warning("_execute_role_rpc called without reply_roles; ignoring")
+            return
+
+        # Determine this worker's role
+        pp_rank = get_pipeline_parallel_rank()
+        pp_size = get_pipeline_parallel_world_size()
+        is_leader = self._is_stage_leader()
+
+        is_first_stage_leader = (pp_rank == 0) and is_leader
+        is_last_stage_leader = (pp_rank == pp_size - 1) and is_leader
+
+        try:
+            # Execute the RPC on all ranks (ignore should_reply from _execute_rpc)
+            result, _ = self._execute_rpc(rpc_request)
+
+            # Send role-based replies
+            if is_first_stage_leader and self.result_mq is not None:
+                # PP0 done: entry readiness with None result
+                self._enqueue_result(RpcReply(rpc_id=reply_roles["entry"], result=None))
+
+            if is_last_stage_leader and self.result_mq is not None:
+                # Full step done: pack SHM and send BaseRunnerOutput
+                if isinstance(result, BaseRunnerOutput):
+                    pack_diffusion_output_shm(result)
+                self._enqueue_result(RpcReply(rpc_id=reply_roles["result"], result=result))
+
+        except Exception as exc:
+            error_str = str(exc)
+            logger.error("Role-based RPC %s failed: %s", rpc_request.get("method"), error_str, exc_info=True)
+            _cleanup_after_execution_error(exc)
+
+            # Fan out error to all roles so both futures complete
+            if self.result_mq is not None:
+                for role_id in reply_roles.values():
+                    self._enqueue_result(RpcReply(rpc_id=role_id, error=error_str))
+
     def _execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
         method = rpc_request["method"]
@@ -2255,10 +2330,15 @@ class WorkerProc:
             # Route message based on type
             elif isinstance(msg, dict) and msg.get("type") == "rpc":
                 try:
-                    rpc_id = msg.get("rpc_id")
-                    result, should_reply = self._execute_rpc(msg)
-                    if should_reply:
-                        self._return_result(result, rpc_id=rpc_id)
+                    # Two-phase Step-PP: check for reply_roles first
+                    if "reply_roles" in msg:
+                        self._execute_role_rpc(msg)
+                    else:
+                        # Legacy single-reply RPC path
+                        rpc_id = msg.get("rpc_id")
+                        result, should_reply = self._execute_rpc(msg)
+                        if should_reply:
+                            self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)
