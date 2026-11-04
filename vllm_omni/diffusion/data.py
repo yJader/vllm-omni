@@ -2306,6 +2306,21 @@ class AsyncDiffusionOutput:
     chunk_index: int | None = None
 
 
+@dataclass
+class RpcReply:
+    """One reply for a role-based RPC request.
+
+    For Step-PP two-phase completion: each role (entry, result) gets
+    an independent rpc_id, and the corresponding stage leader sends
+    one RpcReply per role. This avoids per-rank aggregation and works
+    naturally with PP×TP.
+    """
+
+    rpc_id: str
+    result: Any = None
+    error: str | None = None
+
+
 class DiffusionRequestAbortedError(RuntimeError):
     """Raised when a diffusion request ends via user-visible abort."""
 
