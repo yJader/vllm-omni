@@ -25,7 +25,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor, PipelineStepFutures
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
@@ -768,6 +768,60 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def submit_step(self, scheduler_output: DiffusionSchedulerOutput) -> PipelineStepFutures:
+        """Asynchronously submit one step-mode batch for two-phase PP completion.
+
+        Returns independent futures:
+        * ``pp0_done``: PP0 (first stage) finishes local compute, can accept next batch.
+        * ``step_done``: Last stage produces final ``BaseRunnerOutput`` with updated latents.
+
+        When PP=1, both complete together (fallback to synchronous execute_step).
+        """
+        self._ensure_open()
+
+        # Allocate independent rpc_ids for entry and result roles
+        ids = {"entry": self._next_rpc_id(), "result": self._next_rpc_id()}
+        futs: dict[str, concurrent.futures.Future] = {  # type: ignore[type-arg]
+            role_id: concurrent.futures.Future() for role_id in ids.values()
+        }
+
+        # Register both futures before enqueuing
+        with self._futures_lock:
+            for rpc_id, fut in futs.items():
+                self._rpc_futures[rpc_id] = fut
+
+        try:
+            self._broadcast_mq.enqueue(
+                {  # pyright: ignore[reportOptionalMemberAccess]
+                    "type": "rpc",
+                    "method": "execute_stepwise",
+                    "args": (scheduler_output,),
+                    "kwargs": {},
+                    "exec_all_ranks": True,
+                    "reply_roles": ids,
+                }
+            )
+        except BaseException:
+            # Enqueue failed: revoke both registrations and propagate
+            with self._futures_lock:
+                for rpc_id in ids.values():
+                    self._rpc_futures.pop(rpc_id, None)
+            raise
+
+        # Chain step_done -> pp0_done as a fallback (e.g., PP=1 or entry reply lost)
+        def _chain_completion(f: concurrent.futures.Future) -> None:  # type: ignore[type-arg]
+            entry_fut = futs[ids["entry"]]
+            if not entry_fut.done():
+                exc = f.exception()
+                if exc is not None:
+                    try_set_exception(entry_fut, exc)
+                else:
+                    try_set_result(entry_fut, None)
+
+        futs[ids["result"]].add_done_callback(_chain_completion)
+
+        return PipelineStepFutures(pp0_done=futs[ids["entry"]], step_done=futs[ids["result"]])
+
     def collective_rpc(
         self,
         method: str,
@@ -946,6 +1000,49 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 logger.exception("Result pump dequeue failed")
                 if self._is_failed:
                     break
+                continue
+
+            # ── RpcReply: two-phase Step-PP protocol ──
+            # Process role-based replies before AsyncDiffusionOutput so
+            # submit_step() futures complete independently of the legacy envelope.
+            from vllm_omni.diffusion.data import RpcReply
+
+            if isinstance(msg, RpcReply):
+                # If msg.result is BaseRunnerOutput, unpack its SHM first
+                from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
+                from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+                if isinstance(msg.result, BaseRunnerOutput):
+                    try:
+                        unpack_diffusion_output_shm(msg.result)
+                    except Exception:
+                        logger.exception("SHM unpack failed for RpcReply rpc_id=%s", msg.rpc_id)
+                        msg = RpcReply(rpc_id=msg.rpc_id, error="SHM unpack failed")
+
+                with self._futures_lock:
+                    fut = self._rpc_futures.pop(msg.rpc_id, None)
+
+                if fut is not None and not fut.done():
+                    if msg.error:
+                        try_set_exception(fut, RuntimeError(msg.error))
+                    else:
+                        try_set_result(fut, msg.result)
+                elif msg.error and fut is None:
+                    # Error arrived but Future already gone (another rank reported
+                    # error first, or success already completed). Still mark executor
+                    # as failed and trigger callbacks so we don't silently drop
+                    # a fatal PP step error.
+                    logger.error(
+                        "RpcReply error for unknown/completed rpc_id=%s: %s. Marking executor as failed.",
+                        msg.rpc_id,
+                        msg.error,
+                    )
+                    self._is_failed = True
+                    for callback in self._failure_callbacks:
+                        try:
+                            callback()
+                        except Exception:
+                            logger.exception("Failure callback raised exception")
                 continue
 
             if not isinstance(msg, AsyncDiffusionOutput):

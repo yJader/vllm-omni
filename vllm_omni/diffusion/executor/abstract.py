@@ -6,7 +6,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -20,6 +20,23 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+
+@dataclass(frozen=True)
+class PipelineStepFutures:
+    """Independent entry readiness and whole-step completion for one batch.
+
+    For asynchronous Step-PP execution:
+    * ``pp0_done`` completes when PP0 (first stage) finishes its local
+      computation and can accept another batch.
+    * ``step_done`` completes when the last stage produces the final
+      ``BaseRunnerOutput``, including updated latents.
+
+    When PP=1 or step_execution=False, both futures complete together.
+    """
+
+    pp0_done: Future[None]
+    step_done: Future[BaseRunnerOutput]
 
 
 class DiffusionExecutor(ABC):
@@ -108,6 +125,16 @@ class DiffusionExecutor(ABC):
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute step-mode work from a scheduler output."""
         pass
+
+    def submit_step(self, scheduler_output: DiffusionSchedulerOutput) -> PipelineStepFutures:
+        """Asynchronously submit a step-mode batch for execution.
+
+        Returns independent futures for PP0 entry readiness and full step
+        completion. Executors without async Step-PP (PP=1, or PP>1 without
+        two-phase reply) can fall back to blocking ``execute_step`` and
+        complete both futures together.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support async step submission")
 
     @abstractmethod
     def collective_rpc(
