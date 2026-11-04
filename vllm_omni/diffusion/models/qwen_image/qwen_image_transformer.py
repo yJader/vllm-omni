@@ -24,6 +24,12 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import (
+    PPMissingLayer,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+)
+from vllm.model_executor.sampling_metadata import IntermediateTensors
 
 from vllm_omni.quantization.component_config import safe_quant_config
 
@@ -39,6 +45,9 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.parallel_state import (
+    is_pipeline_last_stage,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -1197,40 +1206,44 @@ class QwenImageTransformer2DModel(CachedTransformer):
             prefix="txt_in",
         )
 
-        self.transformer_blocks = nn.ModuleList(
-            [
-                QwenImageTransformerBlock(
-                    dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    zero_cond_t=zero_cond_t,
-                    quant_config=quant_config,
-                    prefix=f"transformer_blocks.{i}",
-                )
-                for i in range(num_layers)
-            ]
+        # Pipeline Parallelism: make_layers divides transformer blocks across PP stages
+        self.start_layer, self.end_layer, self.transformer_blocks = make_layers(
+            num_layers,
+            lambda prefix: QwenImageTransformerBlock(
+                dim=self.inner_dim,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+                zero_cond_t=zero_cond_t,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            prefix="transformer_blocks",
         )
 
         # Final modulation and output projection are kept full precision —
         # they produce the output latent and are precision-sensitive
-        # (see #2728).
-        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.norm_out.linear = ReplicatedLinear(
-            self.inner_dim,
-            2 * self.inner_dim,
-            bias=True,
-            return_bias=False,
-            quant_config=None,
-            prefix="norm_out.linear",
-        )
-        self.proj_out = ReplicatedLinear(
-            self.inner_dim,
-            patch_size * patch_size * self.out_channels,
-            bias=True,
-            return_bias=False,
-            quant_config=None,
-            prefix="proj_out",
-        )
+        # (see #2728). Only instantiated on the last PP stage.
+        if is_pipeline_last_stage():
+            self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
+            self.norm_out.linear = ReplicatedLinear(
+                self.inner_dim,
+                2 * self.inner_dim,
+                bias=True,
+                return_bias=False,
+                quant_config=None,
+                prefix="norm_out.linear",
+            )
+            self.proj_out = ReplicatedLinear(
+                self.inner_dim,
+                patch_size * patch_size * self.out_channels,
+                bias=True,
+                return_bias=False,
+                quant_config=None,
+                prefix="proj_out",
+            )
+        else:
+            self.norm_out = PPMissingLayer()
+            self.proj_out = PPMissingLayer()
 
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
@@ -1243,6 +1256,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # This ensures modulate_index dimensions align with hidden_states after sharding
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
+
+        # PP helper: factory for empty IntermediateTensors when non-last stages receive no input
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], self.inner_dim
+        )
 
     def forward(
         self,
@@ -1373,7 +1391,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
         elif attention_kwargs is not None:
             attention_kwargs = {k: v for k, v in attention_kwargs.items() if k != QK_NORM_ROPE_TABLE_KEY}
 
-        for index_block, block in enumerate(self.transformer_blocks):
+        # Pipeline Parallelism: only execute blocks assigned to this stage
+        for index_block, block in enumerate(self.transformer_blocks[self.start_layer : self.end_layer]):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1385,6 +1404,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 hidden_states_mask=hidden_states_mask,
             )
 
+        # Non-last PP stage: return intermediate activations for next stage
+        if not is_pipeline_last_stage():
+            return IntermediateTensors({"hidden_states": hidden_states})
+
+        # Last PP stage: apply final norm and projection
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks
