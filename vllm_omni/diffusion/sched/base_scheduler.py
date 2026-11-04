@@ -65,6 +65,7 @@ class BaseScheduler(ABC):
         self._running_sampling_params_key: BatchSamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
+        self.max_num_resident_reqs: int | None = None
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
         self._kv_connector = None
@@ -101,6 +102,7 @@ class BaseScheduler(ABC):
             self.max_num_running_reqs = max(1, int(max_num_seqs))
         except (TypeError, ValueError):
             self.max_num_running_reqs = 1
+        self.max_num_resident_reqs = None
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
         diffusion_kv_enabled = (
@@ -169,6 +171,8 @@ class BaseScheduler(ABC):
 
         # First, schedule the RUNNING request(s)
         for request_id in self._running:
+            if len(scheduled_cached_request_ids) >= self.max_num_running_reqs:
+                break
             state = self._request_states.get(request_id)
             if state is not None and self._can_schedule_running(state):
                 scheduled_cached_request_ids.append(request_id)
@@ -176,7 +180,13 @@ class BaseScheduler(ABC):
         # Second, schedule WAITING requests while capacity remains.
         deferred: list[str] = []
         waiting_budget = len(self._waiting)
-        while self._waiting and waiting_budget and len(self._running) < self.max_num_running_reqs:
+        resident_capacity = self.max_num_resident_reqs or self.max_num_running_reqs
+        while (
+            self._waiting
+            and waiting_budget
+            and len(self._running) < resident_capacity
+            and len(scheduled_cached_request_ids) + len(scheduled_new_reqs) < self.max_num_running_reqs
+        ):
             waiting_budget -= 1
             request_id = self._waiting[0]
             state = self._request_states.get(request_id)

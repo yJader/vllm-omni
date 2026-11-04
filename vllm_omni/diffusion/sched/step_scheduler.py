@@ -30,6 +30,7 @@ class _StepProgress:
     total_steps: int
     interaction_generation: int = 0
     scheduled_interaction_generation: int = 0
+    pipeline_step_inflight: bool = False
     wait_deadline: float | None = None  # None: runnable; inf: indefinite wait.
     resume: Literal["interaction", "timeout"] | None = None
 
@@ -45,18 +46,44 @@ class StepScheduler(BaseScheduler):
         self._request_progress.clear()
 
     def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
-        return self._request_progress[state.request_id].wait_deadline is None
+        progress = self._request_progress[state.request_id]
+        return not progress.pipeline_step_inflight and progress.wait_deadline is None
+
+    def mark_pipeline_inflight(self, req_ids: list[str]) -> None:
+        """Exclude requests with submitted pipeline steps from later schedules."""
+        for req_id in req_ids:
+            progress = self._request_progress.get(req_id)
+            if progress is not None:
+                progress.pipeline_step_inflight = True
+
+    def pipeline_step_completed(self, req_ids: list[str]) -> None:
+        """Make requests eligible for another step after result retirement."""
+        for req_id in req_ids:
+            progress = self._request_progress.get(req_id)
+            if progress is not None:
+                progress.pipeline_step_inflight = False
 
     def get_execution_wait_timeout(self, now: float) -> float | None:
-        deadlines = [p.wait_deadline for p in self._request_progress.values() if p.wait_deadline is not None]
-        if not deadlines or any(self._request_progress[rid].wait_deadline is None for rid in self._running):
+        runnable = [
+            self._request_progress[rid]
+            for rid in self._running
+            if not self._request_progress[rid].pipeline_step_inflight
+        ]
+        runnable_count = sum(progress.wait_deadline is None for progress in runnable)
+        if runnable_count:
             return 0.0
-        if len(self._running) < self.max_num_running_reqs and any(
-            self._can_schedule_waiting(self._request_states[request_id]) for request_id in self._waiting
+        resident_capacity = self.max_num_resident_reqs or self.max_num_running_reqs
+        if (
+            len(self._running) < resident_capacity
+            and runnable_count < self.max_num_running_reqs
+            and any(self._can_schedule_waiting(self._request_states[request_id]) for request_id in self._waiting)
         ):
             return 0.0
         if self._finished_req_ids or self._kv_transfer_request_ids or self._kv_draining_requests:
             return 0.0
+        deadlines = [progress.wait_deadline for progress in runnable if progress.wait_deadline is not None]
+        if not deadlines:
+            return None
         deadline = min(deadlines)
         return None if deadline == inf else max(deadline - now, 0.0)
 
