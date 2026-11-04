@@ -20,6 +20,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     get_pp_group,
     is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 
 
@@ -56,6 +57,10 @@ class AsyncLatents:
             fn()
         self._tensor = self._tensor_dict["latents"]
         return self._tensor
+
+    def resolve(self) -> torch.Tensor:
+        """Resolve the receive explicitly at a transport drain boundary."""
+        return self._resolve()
 
     # Attribute access (e.g. .shape, .to(), .dtype) delegates to the resolved tensor.
     def __getattr__(self, name: str):
@@ -163,21 +168,28 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 if get_pipeline_parallel_world_size() > 2:
                     z = get_pp_group().broadcast(z, src=0)
                 return orig_decode(z, *args, **kwargs)
-            elif is_pipeline_first_stage():
+            elif (
+                is_pipeline_last_stage()
+                if getattr(getattr(self, "od_config", None), "step_execution", False)
+                else is_pipeline_first_stage()
+            ):
                 return orig_decode(z, *args, **kwargs)
             return (None,)  # decoder returns a tuple
 
         self.vae.decode = wrapped_decode
 
     @property
-    def _pp_send_work(self) -> list[torch.distributed.Work]:
+    def _pp_send_work(self) -> list[Any]:
         if not hasattr(self, "_pp_send_work_list"):
-            self._pp_send_work_list: list[torch.distributed.Work] = []
+            self._pp_send_work_list: list[Any] = []
         return self._pp_send_work_list
 
     @_pp_send_work.setter
-    def _pp_send_work(self, work: list[torch.distributed.Work]) -> None:
+    def _pp_send_work(self, work: list[Any]) -> None:
         self._pp_send_work_list = work
+
+    def _prune_pp_send_work(self) -> None:
+        self._pp_send_work = [work for work in self._pp_send_work if not work.is_completed()]
 
     def _sync_pp_send(self) -> None:
         """
@@ -226,7 +238,12 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
 
         CFGParallelMixin._set_transformer_do_true_cfg(self, do_true_cfg)
 
-        self._sync_pp_send()
+        step_pp_async = bool(
+            getattr(getattr(self, "od_config", None), "step_execution", False)
+            and getattr(self, "supports_step_pipeline_parallel", False)
+        )
+        if not step_pp_async:
+            self._sync_pp_send()
 
         pp_group = get_pp_group()
 
@@ -253,7 +270,12 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for kwargs, it in zip(all_kwargs, its):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
-                self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
+                if step_pp_async:
+                    self._prune_pp_send_work()
+                    send_work = pp_group.isend_tensor_dict_nonblocking_metadata(result.tensors)
+                else:
+                    send_work = pp_group.isend_tensor_dict(result.tensors)
+                self._pp_send_work.extend(send_work)
             return None
 
         # Last rank: run full forward
@@ -287,7 +309,7 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
         self,
         noise_pred: torch.Tensor | tuple[torch.Tensor, ...] | None,
         t: torch.Tensor | tuple[torch.Tensor, ...],
-        latents: torch.Tensor | tuple[torch.Tensor, ...],
+        latents: torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents,
         do_true_cfg: bool,
         per_request_scheduler: Any | None = None,
         generator: torch.Generator | None = None,
@@ -309,11 +331,32 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             )
 
         pp_group = get_pp_group()
+        step_pp_async = bool(
+            getattr(getattr(self, "od_config", None), "step_execution", False)
+            and getattr(self, "supports_step_pipeline_parallel", False)
+        )
         if pp_group.is_last_rank:
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
-            self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
+            if step_pp_async and isinstance(latents, torch.Tensor):
+                feedback_work = pp_group.isend_tensor(latents, dst=0)
+            else:
+                feedback_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
+            if step_pp_async:
+                self._pp_send_work.extend(feedback_work)
+            else:
+                self._pp_send_work = feedback_work
         elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
+            if step_pp_async and isinstance(latents, AsyncLatents):
+                latents = latents.resolve()
+            if step_pp_async and isinstance(latents, torch.Tensor):
+                received_latents = torch.empty_like(latents)
+                feedback_handles = pp_group.irecv_tensor(
+                    received_latents,
+                    src=pp_group.world_size - 1,
+                )
+                latents = AsyncLatents({"latents": received_latents}, feedback_handles, [])
+            else:
+                latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
         return latents
