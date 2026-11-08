@@ -19,6 +19,7 @@ from vllm_omni.diffusion.attention.schedule import (
     parse_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
+from vllm_omni.diffusion.distributed import pipeline_parallel as pp_module
 from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
     get_attention_schedule_profile,
@@ -47,6 +48,12 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _single_pipeline_stage(monkeypatch):
+    monkeypatch.setattr(hy3_module, "get_pipeline_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 1)
 
 
 def _pipeline():

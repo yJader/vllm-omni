@@ -529,6 +529,7 @@ def _make_runner(
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )

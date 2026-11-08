@@ -28,12 +28,8 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import (
-    PPMissingLayer,
-    make_empty_intermediate_tensors_factory,
-    make_layers,
-)
-from vllm.model_executor.sampling_metadata import IntermediateTensors
+from vllm.model_executor.models.utils import PPMissingLayer, make_layers
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.quantization.component_config import safe_quant_config
 
@@ -49,9 +45,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
-from vllm_omni.diffusion.distributed.parallel_state import (
-    is_pipeline_last_stage,
-)
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -1387,7 +1381,6 @@ class QwenImageTransformer2DModel(CachedTransformer):
             prefix="txt_in",
         )
 
-        # Pipeline Parallelism: make_layers divides transformer blocks across PP stages
         self.start_layer, self.end_layer, self.transformer_blocks = make_layers(
             num_layers,
             lambda prefix: QwenImageTransformerBlock(
@@ -1453,11 +1446,6 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
-        # PP helper: factory for empty IntermediateTensors when non-last stages receive no input
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], self.inner_dim
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1470,7 +1458,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_kwargs: dict[str, Any] | None = None,
         additional_t_cond=None,
         return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput | list[torch.Tensor]:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors | list[torch.Tensor]:
         """
         The [`QwenTransformer2DModel`] forward method.
 
@@ -1529,6 +1518,14 @@ class QwenImageTransformer2DModel(CachedTransformer):
             else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
         )
 
+        if not is_pipeline_first_stage():
+            if intermediate_tensors is None:
+                raise ValueError("Qwen-Image non-first PP stage requires intermediate_tensors")
+            # Every block updates both streams. Re-encoding the prompt here
+            # would discard all text attention work from the preceding stage.
+            hidden_states = intermediate_tensors["hidden_states"]
+            encoder_hidden_states = intermediate_tensors["encoder_hidden_states"]
+
         # Check for SP auto_pad: create attention mask dynamically if padding was applied
         # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
         hidden_states_mask = None  # default
@@ -1585,8 +1582,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         elif attention_kwargs is not None:
             attention_kwargs = {k: v for k, v in attention_kwargs.items() if k != QK_NORM_ROPE_TABLE_KEY}
 
-        # Pipeline Parallelism: only execute blocks assigned to this stage
-        for index_block, block in enumerate(self.transformer_blocks[self.start_layer : self.end_layer]):
+        for block in self.transformer_blocks[self.start_layer : self.end_layer]:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1598,11 +1594,9 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 hidden_states_mask=hidden_states_mask,
             )
 
-        # Non-last PP stage: return intermediate activations for next stage
         if not is_pipeline_last_stage():
-            return IntermediateTensors({"hidden_states": hidden_states})
+            return IntermediateTensors({"hidden_states": hidden_states, "encoder_hidden_states": encoder_hidden_states})
 
-        # Last PP stage: apply final norm and projection
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks

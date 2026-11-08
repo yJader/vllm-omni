@@ -53,8 +53,10 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -2236,6 +2238,9 @@ class HunyuanImage3Model(nn.Module):
         self.pre_processor = HunyuanImagePreprocessor()
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size
+        )
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
@@ -2516,6 +2521,8 @@ class HunyuanImage3Model(nn.Module):
                     name = "norm.weight"
                 if name == "wte.weight":
                     name = "embed_tokens.weight"
+                if is_pp_missing_parameter(name, self):
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -2549,7 +2556,8 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
-    ) -> tuple | BaseModelOutputWithPast:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple | BaseModelOutputWithPast | IntermediateTensors:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -2560,11 +2568,13 @@ class HunyuanImage3Model(nn.Module):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if inputs_embeds is None:
+        if intermediate_tensors is not None:
+            hidden_states = intermediate_tensors["hidden_states"]
+        elif inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
-        # embed positions
-        hidden_states = inputs_embeds
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -2636,7 +2646,8 @@ class HunyuanImage3Model(nn.Module):
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_idx in range(self.start_layer, self.end_layer):
+            decoder_layer = self.layers[layer_idx]
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2679,6 +2690,9 @@ class HunyuanImage3Model(nn.Module):
             # Since the SP system only records the primary padding information from the first stage,
             # but different stages may introduce different padding sizes, we truncate it to ensure correct output.
             hidden_states = hidden_states[:, :origin_query_len, :].contiguous()
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         next_cache = None
         if use_cache:
