@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -11,8 +11,8 @@ from vllm.distributed import get_dp_group, get_ep_group
 from vllm.distributed.parallel_state import (
     init_model_parallel_group as vllm_init_model_parallel_group,
 )
-from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.ops.fused_moe.moe_comm_method import _MoECommMethods
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ops.fused_moe.moe_comm_method import _MoECommMethods, get_moe_comm_method
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -131,6 +131,8 @@ def reset_fused_moe_forward_context() -> None:
     # DP/PCP padding bounds so the first MoE layer recomputes them.
     forward_context.max_tokens_across_dp = None
     forward_context.max_tokens_across_pcp = None
+    _EXTRA_CTX.max_tokens_across_dp = None
+    _EXTRA_CTX.max_tokens_across_pcp = None
 
 
 def _set_max_tokens(forward_context: Any, hidden_states: torch.Tensor) -> None:
@@ -178,4 +180,14 @@ def fused_moe_forward_context_pre_hook(
         _set_max_tokens(forward_context, hidden_states)
 
     forward_context.moe_comm_type = _select_moe_comm_method(vllm_config=omni_get_ctx().vllm_config)
-    forward_context.moe_comm_method = _MoECommMethods.get(forward_context.moe_comm_type)
+    forward_context.moe_comm_method = get_moe_comm_method(forward_context.moe_comm_type, module.moe_config)
+    # Ascend MRv2 stores these extras in additional_kwargs; use its proxy.
+    for name in (
+        "moe_comm_type",
+        "moe_comm_method",
+        "num_tokens",
+        "in_profile_run",
+        "max_tokens_across_dp",
+        "max_tokens_across_pcp",
+    ):
+        setattr(_EXTRA_CTX, name, getattr(forward_context, name, None))
