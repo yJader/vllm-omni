@@ -177,7 +177,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events = [mp.get_context("spawn").Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -218,7 +218,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # When pumps are active they are the sole readers of the worker result
         # queues; non-async messages are placed here for collective_rpc().
         self._sync_result_buffer: queue.Queue = queue.Queue()
-        if not self.od_config.step_execution:
+        if (
+            not self.od_config.step_execution
+            or getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) > 1
+        ):
             self._start_result_pump()
 
         self._start_worker_monitor()
@@ -263,7 +266,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if remaining <= 0:
                     raise TimeoutError(f"RPC call to {method} timed out.")
                 chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
-            if not self.od_config.step_execution:
+            if self._pump_running:
                 try:
                     return self._sync_result_buffer.get(timeout=chunk_timeout)
                 except queue.Empty:
@@ -1009,7 +1012,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
             if isinstance(msg, RpcReply):
                 # If msg.result is BaseRunnerOutput, unpack its SHM first
-                from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
                 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
                 if isinstance(msg.result, BaseRunnerOutput):
@@ -1023,11 +1025,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     fut = self._rpc_futures.pop(msg.rpc_id, None)
 
                 if fut is not None and not fut.done():
-                    if msg.error:
-                        try_set_exception(fut, RuntimeError(msg.error))
+                    if msg.error is not None:
+                        try_set_exception(
+                            fut, RuntimeError(msg.error or "Worker RPC failed with an empty error message")
+                        )
                     else:
                         try_set_result(fut, msg.result)
-                elif msg.error and fut is None:
+                elif msg.error is not None and fut is None:
                     # Error arrived but Future already gone (another rank reported
                     # error first, or success already completed). Still mark executor
                     # as failed and trigger callbacks so we don't silently drop

@@ -9,6 +9,7 @@ import torch
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.distributed import pipeline_parallel as pp_module
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
@@ -27,6 +28,12 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _single_pipeline_stage(monkeypatch):
+    monkeypatch.setattr(hy3_module, "get_pipeline_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 1)
 
 
 def _pipeline():

@@ -1589,7 +1589,7 @@ class WorkerProc:
     def _is_stage_leader(self) -> bool:
         """Check if this worker is the leader of its PP stage.
 
-        PP stage leader is defined as: tp=0, sp=0, cfg=0, dp=1.
+        PP stage leader is defined as: tp=0, sp=0, cfg=0, dp=0.
         PP configuration validation already requires dp=1, so we only
         need to check the other dimensions.
         """
@@ -1605,7 +1605,7 @@ class WorkerProc:
             get_sequence_parallel_rank() == 0
             and get_classifier_free_guidance_rank() == 0
             and get_tensor_model_parallel_rank() == 0
-            and get_data_parallel_rank() == 1
+            and get_data_parallel_rank() == 0
         )
 
     def _execute_role_rpc(self, rpc_request: dict) -> None:
@@ -1637,8 +1637,10 @@ class WorkerProc:
         is_last_stage_leader = (pp_rank == pp_size - 1) and is_leader
 
         try:
-            # Execute the RPC on all ranks (ignore should_reply from _execute_rpc)
-            result, _ = self._execute_rpc(rpc_request)
+            # Role selection owns reply routing. Preserve this rank's result;
+            # legacy primary-only routing drops the last PP rank's output.
+            local_rpc_request = {**rpc_request, "output_rank": self.gpu_id}
+            result, _ = self._execute_rpc(local_rpc_request)
 
             # Send role-based replies
             if is_first_stage_leader and self.result_mq is not None:
@@ -1652,7 +1654,7 @@ class WorkerProc:
                 self._enqueue_result(RpcReply(rpc_id=reply_roles["result"], result=result))
 
         except Exception as exc:
-            error_str = str(exc)
+            error_str = str(exc) or type(exc).__name__
             logger.error("Role-based RPC %s failed: %s", rpc_request.get("method"), error_str, exc_info=True)
             _cleanup_after_execution_error(exc)
 

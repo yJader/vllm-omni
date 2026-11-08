@@ -43,6 +43,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRow,
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
@@ -1108,14 +1109,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         ``extra``. Invalidate it when its composition contains a retired request;
         surviving requests retain their own state and are repacked on the next step.
         """
+        batch = getattr(self, "input_batch", None)
+        batch_states = {state.request_id: state for state in getattr(batch, "states", ())}
         for request_id in request_ids:
-            state = self.state_cache.pop(request_id, None)
+            state = self.state_cache.get(request_id) or batch_states.get(request_id)
+            self._drain_pending_latents(state)
+            state = self.state_cache.pop(request_id, None) or state
             release = getattr(getattr(self, "pipeline", None), "release_step_request", None)
             if state is not None and callable(release):
                 release(state)
-        batch = getattr(self, "input_batch", None)
         if batch is not None and any(request_id in batch.request_ids for request_id in request_ids):
             self.input_batch = None
+
+    @staticmethod
+    def _drain_pending_latents(state: StepRequestState | None) -> None:
+        """Resolve pending feedback before consuming or releasing request latents."""
+        if state is not None and isinstance(state.latents, AsyncLatents):
+            state.latents = state.latents.resolve()
 
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
@@ -1196,6 +1206,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         prepared_states: list[StepRequestState] = []
         error_outputs: list[RunnerOutput] = []
         for state in states:
+            # Consume PP feedback only when the next step gathers the latents.
+            self._drain_pending_latents(state)
             if state.request_id in new_request_ids or state.pending_chunk_boundary:
                 # Everything that requires rank-synchronization must be called
                 # inside a try, record the exception and handle with `_dit_any_rank_failed`.
@@ -1204,6 +1216,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # all-reduce here while every peer proceeds into it, and the
                 # peers then hang on the NCCL collective until timeout.
                 def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
+                    self._drain_pending_latents(state)
                     self.state_cache.pop(state.request_id, None)
                     if per_req_exc is None:
                         per_req_exc = RuntimeError(
@@ -1293,18 +1306,21 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         interrupted: bool = False,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
-        else:
-            input_batch.latents = gathered_latents.clone()
+        # Gathering pending PP feedback would block PP0 before it can accept
+        # another batch. The next prepare gathers it after resolving the receive.
+        if not any(isinstance(state.latents, AsyncLatents) for state in states):
+            gathered_latents = torch.cat([state.latents for state in states], dim=0)
+            if (
+                input_batch.latents.size() == gathered_latents.size()
+                and input_batch.latents.dtype == gathered_latents.dtype
+                and input_batch.latents.device == gathered_latents.device
+            ):
+                input_batch.latents.copy_(gathered_latents)
+            else:
+                input_batch.latents = gathered_latents.clone()
 
-        self.input_batch = input_batch
-        scatter_latents(states, input_batch)
+            self.input_batch = input_batch
+            scatter_latents(states, input_batch)
 
         # Include per-request errors, whose cache entries were already removed.
         self.release_step_requests(
@@ -1547,6 +1563,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
+                            self._drain_pending_latents(req)
                             self.state_cache.pop(req.request_id, None)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",

@@ -412,7 +412,6 @@ def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypa
     """A finished step request must not survive into a text fallback wave."""
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestDiffusionOutputPipeline()
-    runner.state_cache = {"aborted-step-request": object()}
     old_step_batch = InputBatch.make_batch(
         [
             StepRequestState(
@@ -423,6 +422,7 @@ def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypa
             )
         ]
     )
+    runner.state_cache = {"aborted-step-request": old_step_batch.states[0]}
     runner.input_batch = old_step_batch
     runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
     runner.remove_diffusion_kv_requests = Mock()

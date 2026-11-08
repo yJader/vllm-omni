@@ -24,6 +24,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_last_stage
+from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -267,6 +269,7 @@ def apply_rotary_emb_qwen(
 
 class QwenImagePipeline(
     nn.Module,
+    PipelineParallelMixin,
     QwenImageCFGParallelMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
@@ -278,6 +281,7 @@ class QwenImagePipeline(
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
     supports_step_execution: ClassVar[bool] = True
+    supports_step_pipeline_parallel: ClassVar[bool] = True
 
     supports_weight_reload: ClassVar[bool] = True
 
@@ -998,6 +1002,9 @@ class QwenImagePipeline(
     ) -> DiffusionOutput:
         """Decode final latents from *state*."""
         self._current_timestep = None
+        self._sync_pp_send()
+        if not is_pipeline_last_stage():
+            return DiffusionOutput()
 
         height = state.sampling.height or self.default_sample_size * self.vae_scale_factor
         width = state.sampling.width or self.default_sample_size * self.vae_scale_factor

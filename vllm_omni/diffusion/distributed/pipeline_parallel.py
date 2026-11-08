@@ -23,6 +23,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     is_pipeline_last_stage,
 )
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+
 
 class AsyncLatents:
     """Transparent async wrapper returned by scheduler_step on rank 0.
@@ -204,6 +207,10 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 handle.wait()
             self._pp_send_work = []
 
+    def release_step_request(self, state: "StepRequestState") -> None:
+        """Drain PP sends before retiring a completed, cancelled or failed request."""
+        self._sync_pp_send()
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -344,6 +351,7 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             else:
                 feedback_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
             if step_pp_async:
+                self._prune_pp_send_work()
                 self._pp_send_work.extend(feedback_work)
             else:
                 self._pp_send_work = feedback_work

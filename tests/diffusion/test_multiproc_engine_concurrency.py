@@ -77,6 +77,7 @@ def _make_executor(num_gpus: int = 1):
     executor._closed = False
     executor._processes = []
     executor._is_failed = False
+    executor._pump_running = False
     executor._failure_callbacks = []
     executor._completed_outputs = {}
     executor._dropped_output_ids = OrderedDict()
@@ -327,6 +328,7 @@ class TestRequestModeDispatch:
             parallel_config=SimpleNamespace(data_parallel_size=2),
         )
         executor._sync_result_buffer = res_q
+        executor._pump_running = True
 
         def worker():
             request = req_q.get(timeout=2)
@@ -570,6 +572,7 @@ class TestRequestModeDispatch:
             dlo_use_allgather=True,
         )
         executor._sync_result_buffer = res_q
+        executor._pump_running = True
         executor._fail_closed_on_dp_wave_timeout = Mock()
         monkeypatch.setattr(executor_module, "_DLO_DP_WAVE_TIMEOUT_S", 0.05)
 
@@ -1127,6 +1130,7 @@ class TestMultiprocExecutorRaisesEngineDeadError:
         executor._result_mq = MagicMock()
         executor._result_mq.dequeue = MagicMock(side_effect=TimeoutError)
         executor._is_failed = True
+        executor._pump_running = False
 
         with pytest.raises(EngineDeadError):
             executor.collective_rpc(

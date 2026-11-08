@@ -90,6 +90,12 @@ When a pipeline class is defined, `PipelineParallelMixin` wraps its `diffuse()` 
 `finally` block after `diffuse()` returns or raises. This keeps model code free of explicit PP cleanup while still
 ensuring that the final non-blocking PP send completes before decode or later collectives.
 
+Step execution calls `denoise_step()` and `step_scheduler()` directly, so it does not pass through the `diffuse()`
+wrapper. Its `post_decode()` must flush pending sends before decode. The mixin also implements the runner's
+`release_step_request()` hook to drain sends when a completed, cancelled, or failed request is retired; pipelines
+overriding that hook must preserve this drain. During execution, completed feedback sends are pruned without waiting,
+and pending receives remain asynchronous until the runner consumes or releases their request latents.
+
 ---
 
 ## Step-by-Step Implementation
@@ -294,13 +300,13 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 
 **Symptoms:** Importing a pipeline that inherits `PipelineParallelMixin` raises:
 
-```
+```text
 TypeError: YourPipeline inherits PipelineParallelMixin but not CFGParallelMixin.
 ```
 
 or:
 
-```
+```text
 TypeError: YourPipeline must inherit PipelineParallelMixin before CFGParallelMixin ...
 ```
 
