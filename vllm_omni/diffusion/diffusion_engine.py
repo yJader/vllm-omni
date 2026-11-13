@@ -950,14 +950,8 @@ class DiffusionEngine:
             self._emit_finished_outputs(finished_ids, None)
             return False
 
-        self._prepare_kv_for_forward(sched_output)
-        if not sched_output.scheduled_request_ids:
-            runner_output = BatchRunnerOutput.from_list([])
-            self._poll_native_kv()
-            finished_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            self._emit_outputs(finished_ids, [], runner_output, worker_execution_completed=True)
-            return False
-
+        # KV-only waves must also reach the Worker now that preparation is
+        # folded into execute_stepwise, even when no model requests are ready.
         # TODO: The implementation sketch names scheduled_seq_groups; this API exposes request IDs.
         request_ids = sched_output.scheduled_request_ids
         with self._cv:
@@ -1015,6 +1009,9 @@ class DiffusionEngine:
             deferred_aborts = self._deferred_pipeline_aborts.intersection(request_ids)
             runner_output = futures.step_done.result()
             with self._cv:
+                kv_output = getattr(runner_output, "_pp_kv_connector_output", None)
+                if kv_output is not None:
+                    self.scheduler.update_kv_connector_output(kv_output)
                 if deferred_aborts:
                     self.scheduler.finish_requests(list(deferred_aborts), DiffusionRequestStatus.FINISHED_ABORTED)
                     self._deferred_pipeline_aborts.difference_update(deferred_aborts)

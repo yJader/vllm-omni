@@ -38,6 +38,7 @@ def test_last_stage_role_reply_retains_local_runner_result(monkeypatch):
     result = BatchRunnerOutput.from_list([])
     worker = WorkerProc.__new__(WorkerProc)
     worker.gpu_id = 1
+    worker._async_output_queue = None
     worker.result_mq = object()
     worker.worker = SimpleNamespace(execute_method=lambda *args, **kwargs: result)
     replies: list[RpcReply] = []

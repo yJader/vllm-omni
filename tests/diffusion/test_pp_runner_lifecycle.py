@@ -61,9 +61,12 @@ def test_step_tail_defers_feedback_until_next_prepare(pending_feedback):
 
 
 def test_release_drains_feedback_before_model_hook(pending_feedback):
+    """Mid-batch abort still drains to avoid leaking comm handles."""
     runner, state, _, work = pending_feedback
     observations = []
     runner.pipeline.release_step_request = lambda state: observations.append(work.waits)
+
+    assert not state.request_denoise_completed
 
     runner.release_step_requests([state.request_id])
 
@@ -74,18 +77,38 @@ def test_release_drains_feedback_before_model_hook(pending_feedback):
 
 
 @pytest.mark.parametrize("terminal", ["completed", "interrupted", "failed"])
-def test_terminal_step_drains_feedback(pending_feedback, terminal):
+def test_terminal_step_drains_feedback_before_model_hook(pending_feedback, terminal):
+    """Unused feedback still owns receive storage until retirement drains it."""
     runner, state, batch, work = pending_feedback
+    observations = []
+
+    def release(released_state):
+        assert released_state is state
+        assert work.waits == 1
+        assert isinstance(released_state.latents, torch.Tensor)
+        torch.testing.assert_close(released_state.latents, torch.full((1, 4, 2), 7.0))
+        observations.append(released_state.request_id)
+
+    runner.pipeline.release_step_request = release
     if terminal == "completed":
         state.step_index = state.total_steps
+        assert state.request_denoise_completed
     elif terminal == "failed":
+        # Per-request failure removes the cache entry before the step tail;
+        # the cached batch must retain the state until its feedback is drained.
         runner.state_cache.pop(state.request_id)
+        assert batch.states[0] is state
 
     runner._update_states_after([state], batch, interrupted=terminal == "interrupted")
 
     assert work.waits == 1
+    assert observations == [state.request_id]
     assert state.request_id not in runner.state_cache
     assert runner.input_batch is None
+
+    runner.release_step_requests([state.request_id])
+    assert work.waits == 1
+    assert observations == [state.request_id]
 
 
 def test_plain_tensor_updates_refresh_cached_batch(pending_feedback):
@@ -100,10 +123,14 @@ def test_plain_tensor_updates_refresh_cached_batch(pending_feedback):
 
 
 def test_release_drains_pp_sends_after_feedback(pending_feedback):
+    """Pipeline PP sends are drained by the pipeline hook, not the runner."""
+
     class Pipeline(PipelineParallelMixin, CFGParallelMixin):
         pass
 
     runner, state, _, receive_work = pending_feedback
+    assert not state.request_denoise_completed
+
     runner.pipeline = Pipeline()
     send_work = _Work()
     runner.pipeline._pp_send_work = [send_work]

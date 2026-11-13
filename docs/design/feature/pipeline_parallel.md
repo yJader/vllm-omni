@@ -96,6 +96,13 @@ wrapper. Its `post_decode()` must flush pending sends before decode. The mixin a
 overriding that hook must preserve this drain. During execution, completed feedback sends are pruned without waiting,
 and pending receives remain asynchronous until the runner consumes or releases their request latents.
 
+A step pipeline may set `feedback_required=False` when its final latents are consumed only on the last stage. Qwen and
+Hunyuan step schedulers use this on their final denoise step: both ends omit feedback, and decode still completes
+inside that step. Earlier transfers must still drain before release.
+
+See [Async diffusion output](async_diffusion_output.md#step-mode-pp-output) for background output packing and
+[Diffusion runtime](../module/diffusion/diffusion_runtime.md#step-pp-completion) for step completion and retirement.
+
 ---
 
 ## Step-by-Step Implementation

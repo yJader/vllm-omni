@@ -2607,6 +2607,8 @@ class HunyuanImage3Pipeline(
             do_true_cfg=False,
             per_request_scheduler=state.scheduler,
             generator=generator,
+            # Final latents are decoded only on the last stage.
+            feedback_required=state.step_index + 1 < state.total_steps,
         )
         state.step_index += 1
 

@@ -92,7 +92,7 @@ def test_pp_boundary_preserves_image_and_updated_text_streams(monkeypatch):
         _model(2, 4)(**kwargs)
 
 
-def test_terminal_steps_drain_feedback_sends_before_decode(monkeypatch):
+def test_terminal_steps_drain_existing_sends_before_decode(monkeypatch):
     class Work:
         waited = False
 
@@ -133,6 +133,11 @@ def test_terminal_steps_drain_feedback_sends_before_decode(monkeypatch):
 
     pipeline._decode_latents = decode
     for index in range(3):
+        # An older transfer still needs its drain even when the current final
+        # step itself does not post feedback.
+        pending = Work()
+        works.append(pending)
+        pipeline._pp_send_work = [pending]
         state = StepRequestState(
             request_id=str(index),
             sampling=OmniDiffusionSamplingParams(height=16, width=16, output_type="latent"),
@@ -176,3 +181,55 @@ def test_output_layers_are_allocated_only_on_last_stage(monkeypatch, last_stage)
     assert ("proj_out" in allocated) is last_stage
     assert isinstance(model.norm_out, PPMissingLayer) is not last_stage
     assert isinstance(model.proj_out, PPMissingLayer) is not last_stage
+
+
+@pytest.mark.parametrize("first_stage", [False, True])
+@pytest.mark.parametrize("step_index", [0, 1], ids=["continuation", "terminal"])
+def test_qwen_posts_feedback_only_when_another_step_needs_it(monkeypatch, first_stage, step_index):
+    """Omitting unused final feedback must agree on its sending and receiving ranks."""
+    from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
+
+    feedback = []
+
+    class Group:
+        is_first_rank = first_stage
+        is_last_rank = not first_stage
+        world_size = 2
+
+        def isend_tensor(self, tensor, dst):
+            feedback.append(("send", dst))
+            return []
+
+        def irecv_tensor(self, tensor, src):
+            feedback.append(("receive", src))
+            return []
+
+    class Scheduler:
+        def step(self, noise_pred, timestep, latents, return_dict):
+            return (latents + noise_pred,)
+
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(pp_module, "get_pp_group", Group)
+    pipeline = object.__new__(pipeline_module.QwenImagePipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(step_execution=True)
+    pipeline._interrupt = False
+    state = StepRequestState(
+        request_id="request",
+        sampling=OmniDiffusionSamplingParams(),
+        timesteps=torch.tensor([1.0, 0.5]),
+        step_index=step_index,
+        latents=torch.zeros(1, 4, 2),
+        scheduler=Scheduler(),
+    )
+    pipeline.step_scheduler(state, None if first_stage else torch.ones_like(state.latents))
+
+    assert state.step_index == step_index + 1
+    if step_index == 0:
+        assert feedback == ([("receive", 1)] if first_stage else [("send", 0)])
+        assert isinstance(state.latents, AsyncLatents) is first_stage
+    else:
+        assert feedback == [], "unused final feedback serializes the next batch through its receive stream wait"
+        assert isinstance(state.latents, torch.Tensor)
+    if not first_stage:
+        torch.testing.assert_close(state.latents, torch.ones(1, 4, 2))
