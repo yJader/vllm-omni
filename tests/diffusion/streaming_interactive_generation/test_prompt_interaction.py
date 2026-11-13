@@ -104,6 +104,7 @@ def _make_diffusion_model_runner(
     runner.offload_backend = None
     runner.prompt_embed_cache = None
     runner.kv_transfer_manager = SimpleNamespace(
+        config=SimpleNamespace(need_recv_cache=False),
         receive_multi_kv_cache_distributed=lambda *a, **k: None,
     )
     # HeliosPipeline skeletons from object.__new__ are not full SupportsStepExecution

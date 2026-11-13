@@ -991,6 +991,9 @@ class QwenImagePipeline(
             state.latents,
             state.do_true_cfg,
             per_request_scheduler=state.scheduler,
+            # Final latents are decoded on the last stage. Posting an unused
+            # receive on PP0 would stall its next batch when state is retired.
+            feedback_required=state.step_index + 1 < state.total_steps,
         )
 
         state.step_index += 1

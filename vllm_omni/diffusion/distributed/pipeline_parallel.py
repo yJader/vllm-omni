@@ -320,6 +320,8 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
         do_true_cfg: bool,
         per_request_scheduler: Any | None = None,
         generator: torch.Generator | None = None,
+        *,
+        feedback_required: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
@@ -330,7 +332,10 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
         Returns a ``AsyncLatents`` on rank 0 that transparently defers
         ``handle.wait()`` until the tensor is actually consumed (via attribute
         access or a torch operation), keeping the rank non-blocking after the
-        ``irecv`` is posted.
+        ``irecv`` is posted. Step pipelines whose final decode runs on the last
+        stage can set ``feedback_required=False`` when no next step consumes the
+        updated latents. Both ends then omit that unused transfer; existing
+        communication still drains normally at request retirement.
         """
         if get_pipeline_parallel_world_size() == 1:
             return super().scheduler_step_maybe_with_cfg(
@@ -346,6 +351,8 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
+            if step_pp_async and not feedback_required:
+                return latents
             if step_pp_async and isinstance(latents, torch.Tensor):
                 feedback_work = pp_group.isend_tensor(latents, dst=0)
             else:
@@ -356,6 +363,8 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             else:
                 self._pp_send_work = feedback_work
         elif pp_group.is_first_rank:
+            if step_pp_async and not feedback_required:
+                return latents
             if step_pp_async and isinstance(latents, AsyncLatents):
                 latents = latents.resolve()
             if step_pp_async and isinstance(latents, torch.Tensor):

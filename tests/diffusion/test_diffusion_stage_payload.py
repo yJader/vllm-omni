@@ -627,6 +627,7 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
         assert "text_encoder_output" in state_request.prompt["additional_information"]
         kv_calls.append(state_request.request_id)
 
+    runner.kv_transfer_manager.config = SimpleNamespace(need_recv_cache=True)
     runner.kv_transfer_manager.receive_multi_kv_cache_distributed = receive_kv
     scheduled = DiffusionSchedulerOutput(
         step_id=0,

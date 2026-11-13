@@ -1113,6 +1113,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         batch_states = {state.request_id: state for state in getattr(batch, "states", ())}
         for request_id in request_ids:
             state = self.state_cache.get(request_id) or batch_states.get(request_id)
+            # Unused final feedback still owns an in-flight receive buffer.
+            # Establish its stream dependency before releasing request storage.
             self._drain_pending_latents(state)
             state = self.state_cache.pop(request_id, None) or state
             release = getattr(getattr(self, "pipeline", None), "release_step_request", None)
@@ -1169,10 +1171,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
-                if self.kv_transfer_manager is not None:
+                cfg_kv_collect_func = getattr(self.od_config, "cfg_kv_collect_func", None)
+                if self.kv_transfer_manager is not None and (
+                    self.kv_transfer_manager.config.need_recv_cache
+                    or (cfg_kv_collect_func is not None and getattr(new_state.sampling, "cfg_kv_request_ids", None))
+                ):
+                    # Disabled receive must skip distribution too: broadcasting
+                    # None on world would synchronize otherwise independent PP stages.
+                    # Keep configured receives on followers, which have no local payload yet.
                     self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                         state_req,
-                        cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                        cfg_kv_collect_func=cfg_kv_collect_func,
                         target_device=self._target_device,
                     )
                 self.state_cache[request_id] = new_state

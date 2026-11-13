@@ -218,6 +218,7 @@ executor call.
 | --- | --- | --- | --- |
 | Request batch | `RequestScheduler` | `execute_batch()` | `execute_model()` for one request, or `execute_model_batch()` for a fused batch |
 | Step batch | `StepScheduler` | `execute_step()` | `execute_stepwise()` |
+| Async step PP | `StepScheduler` | `submit_step()` | `execute_stepwise()` |
 
 **Request mode** runs a complete pipeline forward for each scheduled wave. A
 single-request wave is the conservative path. A multi-request wave usually
@@ -338,11 +339,23 @@ messages keyed by `async_output_id`:
 
 The worker queues background packing work before it enqueues `COMPUTE_DONE`,
 but either message may reach the executor first. The result pump and
-`execute_batch()` must handle both orderings. Step mode keeps the synchronous
-result path and does not start those pumps.
+`execute_batch()` must handle both orderings.
 
-See [Async diffusion output](../../feature/async_diffusion_output.md) for the
-multiproc request-mode timeline.
+#### Step PP completion
+
+`submit_step()` broadcasts one batch to all workers and returns two Futures. Workers select reply roles by their
+logical PP stage and stage-leader rank; each role has its own RPC ID.
+
+| Reply role | Future | Completion boundary |
+| --- | --- | --- |
+| First-stage leader (`entry`) | `pp0_done` | Local execution returned; the Engine may submit another batch if capacity permits |
+| Last-stage leader (`result`) | `step_done` | The complete step output is ready, including decode and output packing for finished requests |
+
+The Engine retires results in submission order and returns batch capacity only after retirement. `pp0_done` allows
+submission but does not release capacity or clear a request's in-flight state. The result pump completes both Futures
+independently of further Engine submissions.
+
+See [Async diffusion output](../../feature/async_diffusion_output.md#step-mode-pp-output) for background output packing.
 
 ### Ray backend
 

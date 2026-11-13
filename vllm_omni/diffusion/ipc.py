@@ -62,7 +62,7 @@ def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.nda
     from multiprocessing import shared_memory
 
     nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
-    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    shm = shared_memory.SharedMemory(create=True, size=max(nbytes, 1))
     array = np.ndarray(shape, dtype=dtype, buffer=shm.buf[:nbytes])
     handle = {
         "name": shm.name,
@@ -298,7 +298,10 @@ def _pack_tensor_if_large(
         storage_bytes = val.untyped_storage().nbytes()
     except Exception:
         storage_bytes = view_bytes
-    if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD:
+    # Side-stream output must materialize even small device tensors here.
+    # Otherwise MessageQueue pickling performs their D2H on the default
+    # stream, potentially waiting for the next batch's queued compute.
+    if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD or (d2h_stream is not None and val.device.type != "cpu"):
         return _tensor_to_shm(val, d2h_stream=d2h_stream, created=created, enable_registered_shm=enable_registered_shm)
     return val
 
@@ -515,8 +518,9 @@ def pack_diffusion_output_shm(
     ``RunnerOutput`` objects in ``.runner_outputs``, or a DP-tagged dict
     ``{"dp_rank": int, "output": DiffusionOutput}`` used by DP multi-concurrency.
 
-    If *d2h_stream* is provided, D2H copies use that stream (non-blocking on
-    the default stream).  The caller must synchronize *d2h_stream* afterward.
+    If *d2h_stream* is provided, all device tensors (including those below
+    the size threshold) use that stream so queue serialization cannot copy
+    them on the default stream. The caller must synchronize it afterward.
 
     ``enable_registered_shm`` opts explicitly identified video tensors into
     direct CUDA-to-SHM transfer and borrowed CPU views. Other payloads keep
