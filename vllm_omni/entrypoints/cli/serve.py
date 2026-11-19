@@ -1033,6 +1033,12 @@ class OmniServeCommand(CLISubcommand):
                 "(default: 128). Unset leaves the deploy YAML value in force."
             ),
         )
+        omni_config_group.add_argument(
+            "--max-concurrent-batches",
+            type=int,
+            default=None,
+            help="Maximum in-flight diffusion Step-PP batches (default: pipeline parallel size).",
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(

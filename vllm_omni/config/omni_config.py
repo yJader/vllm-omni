@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 import regex as re
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
 from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
@@ -1027,6 +1027,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     engine_backend: str | type = "default"
     diffusion_model_runner_cls: str | type | None = None
     request_batch_max_wait_ms: float | None = None
+    max_concurrent_batches: StrictInt | None = None
     streaming_output: bool = False
     model_arch: str | None = None
     task_type: str | None = None
