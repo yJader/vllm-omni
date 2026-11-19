@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode, _RpcTask
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.executor.abstract import PipelineStepFutures
@@ -84,6 +84,26 @@ def _make_engine(loop: asyncio.AbstractEventLoop) -> DiffusionEngine:
     engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
     engine.worker_thread.start()
     return engine
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(None, 2), (1, 1), (3, 3)],
+)
+def test_diffusion_config_resolves_max_concurrent_batches(configured, expected):
+    config = OmniDiffusionConfig(
+        model="test",
+        parallel_config={"pipeline_parallel_size": 2},
+        max_concurrent_batches=configured,
+    )
+
+    assert config.max_concurrent_batches == expected
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5])
+def test_diffusion_config_rejects_invalid_max_concurrent_batches(invalid):
+    with pytest.raises(ValueError, match="max_concurrent_batches"):
+        OmniDiffusionConfig(model="test", max_concurrent_batches=invalid)
 
 
 def _add_request(engine: DiffusionEngine, request_id: str) -> asyncio.Queue:

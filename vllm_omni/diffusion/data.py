@@ -1280,6 +1280,8 @@ class OmniDiffusionConfig:
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
+    # Maximum submitted Step-PP batches awaiting FIFO retirement.
+    max_concurrent_batches: int | None = None
 
     # Native vLLM KV-cache sizing inputs used only by paged_scheduler mode.
     # These mirror the structured stage cache/scheduler config until all
@@ -1501,6 +1503,11 @@ class OmniDiffusionConfig:
             self.parallel_config = DiffusionParallelConfig.from_dict(dict(self.parallel_config))
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
             self.parallel_config = DiffusionParallelConfig()
+
+        if self.max_concurrent_batches is None:
+            self.max_concurrent_batches = self.parallel_config.pipeline_parallel_size
+        elif type(self.max_concurrent_batches) is not int or self.max_concurrent_batches < 1:
+            raise ValueError(f"max_concurrent_batches must be a positive integer, got {self.max_concurrent_batches!r}")
 
         if self.num_gpus is None:
             if self.parallel_config is not None:

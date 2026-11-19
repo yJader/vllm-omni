@@ -367,6 +367,7 @@ class OmniEngineArgs(EngineArgs):
     omni: bool = False
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float | None = None
+    max_concurrent_batches: int | None = None
     fa_deterministic: bool = False
     # Tensor-parallel degree for the diffusion text encoder (forwarded to
     # DiffusionParallelConfig via the generic diffusion fallback). Declared

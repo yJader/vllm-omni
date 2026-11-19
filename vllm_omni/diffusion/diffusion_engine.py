@@ -522,8 +522,13 @@ class DiffusionEngine:
             and callable(getattr(self.executor, "submit_step", None))
         )
         if self._pipeline_async_enabled:
-            self.scheduler.max_num_resident_reqs = self.scheduler.max_num_running_reqs * pipeline_parallel_size
-        self._max_concurrent_batches = pipeline_parallel_size
+            max_concurrent_batches = getattr(self.od_config, "max_concurrent_batches", None)
+            self._max_concurrent_batches = (
+                pipeline_parallel_size if max_concurrent_batches is None else int(max_concurrent_batches)
+            )
+            self.scheduler.max_num_resident_reqs = self.scheduler.max_num_running_reqs * self._max_concurrent_batches
+        else:
+            self._max_concurrent_batches = pipeline_parallel_size
         self._pending_batches: deque[tuple[str, DiffusionSchedulerOutput, PipelineStepFutures]] = deque()
         self._pp0_ready = True
         self._control_gate_closed = False
