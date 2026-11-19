@@ -30,7 +30,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor, _KVOutputAggregator
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -43,10 +43,13 @@ logger = init_logger(__name__)
 class UniProcDiffusionExecutor(DiffusionExecutor):
     """Runs a single diffusion worker inline, with no IPC of any kind."""
 
+    supports_async_kv = True
+
     def _init_executor(self) -> None:
         from vllm_omni.diffusion.worker.diffusion_worker import WorkerWrapperBase
 
         self._closed = False
+        self._kv_aggregator = _KVOutputAggregator(1)
         self._is_failed = False
         self.driver_worker = None
         self._failure_callbacks: list[Callable[[], None]] = []
@@ -189,6 +192,8 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             exec_all_ranks=True,
         )
         if isinstance(result, BaseRunnerOutput):
+            if scheduler_output.has_nonblocking_kv_work:
+                return self._kv_aggregator.aggregate([result], scheduler_output.kv_finished_request_ids)
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
@@ -255,6 +260,13 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                 worker.shutdown()
             except Exception as exc:
                 logger.warning("Diffusion worker shutdown encountered an error: %s", exc)
+                if getattr(self.od_config, "kv_transfer_config", None) is not None or (
+                    getattr(self.od_config, "omni_kv_config", None) or {}
+                ).get("need_recv_cache", False):
+                    self.driver_worker = worker
+                    self._closed = False
+                    raise  # retain Scheduler pages if stopping remote writes failed
+        self._kv_aggregator.close()
         # Unlike the multiprocess executor, tearing down an inline worker does
         # not exit its process. Drop the final model reference and return cached
         # allocations to the driver so a subsequent engine can use the device.

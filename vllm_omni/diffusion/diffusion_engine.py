@@ -14,7 +14,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import AsyncGeneratorType
 from typing import TYPE_CHECKING, Any, cast
@@ -484,6 +484,36 @@ class DiffusionEngine:
             )
         else:
             self.dp_concurrent = False
+        # The result-queue protocol has one replica-wide rank set. CFG
+        # companion collectors and device-pool legacy transports retain their
+        # existing synchronous receive contract in this version.
+        from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+
+        legacy_config = getattr(self.od_config, "omni_kv_config", None) or {}
+        legacy_connector = (legacy_config.get("connector_config") or {}).get("type")
+        legacy_multi_reader = legacy_connector in (
+            "SharedMemoryConnector",
+            "MooncakeStoreConnector",
+            "MooncakeConnector",
+        )
+        self.scheduler.async_kv = (
+            getattr(self.executor, "supports_async_kv", False) is True
+            and isinstance(self.scheduler, BaseScheduler)
+            and dp_size == 1
+            and getattr(self.od_config, "cfg_kv_collect_func", None) is None
+            and not OmniKVTransferManager._receiver_pool_on_device(getattr(self.od_config, "omni_kv_config", None))
+            and bool(
+                getattr(self.od_config, "kv_transfer_config", None)
+                or (getattr(self.od_config, "omni_kv_config", None) or {}).get("need_recv_cache", False)
+            )
+            and (
+                getattr(self.od_config, "kv_transfer_config", None) is not None
+                or getattr(self.od_config, "num_gpus", 1) == 1
+                or legacy_multi_reader
+            )
+        )
+        self._kv_poll_delay = 0.0002
+        self._kv_poll_deadline = 0.0
         parallel_config = getattr(self.od_config, "parallel_config", None)
         pipeline_parallel_size = max(1, int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1))
         self._pipeline_async_enabled = (
@@ -537,6 +567,14 @@ class DiffusionEngine:
         # Copied onto the existing output metrics payload so queue monitoring
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
+        self._kv_failures: dict[str, str] = {}
+        if getattr(self.scheduler, "async_kv", False):
+            self.executor.kv_failure_callback = self._on_kv_failure
+
+    def _on_kv_failure(self, errors: dict[str, str]) -> None:
+        with self._cv:
+            self._kv_failures.update(errors)
+            self._cv.notify_all()
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -740,6 +778,16 @@ class DiffusionEngine:
                     return
 
             # Phase 2: Shared control flow
+            with self._cv:
+                errors, self._kv_failures = getattr(self, "_kv_failures", {}), {}
+            if errors:
+                self.scheduler.finish_kv_transfer(BatchRunnerOutput([], kv_failed_req_ids=errors))
+                failed_ids = {
+                    rid
+                    for rid in errors
+                    if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
+                }
+                self._emit_finished_outputs(failed_ids)
             self._process_aborts_queue()
             self._process_rpc_queue()
             self._expire_streaming_idle()
@@ -832,19 +880,16 @@ class DiffusionEngine:
             else:
                 # Sync execution
                 try:
-                    self._prepare_kv_for_forward(sched_output)
-                    runner_output: BaseRunnerOutput = (
-                        self.execute_fn(sched_output)
-                        if sched_output.scheduled_request_ids
-                        else BatchRunnerOutput.from_list([])
-                    )
-                    self._poll_native_kv()
+                    runner_output = self._execute_scheduled_step(sched_output)
                     worker_execution_completed = True
                 except Exception as exc:
                     # Shutdown can interrupt an in-flight executor call. Exit through
                     # the loop tail so pending RPCs are failed instead of left waiting.
                     if self._closed:
                         break
+                    if getattr(sched_output, "has_nonblocking_kv_work", False):
+                        self._fail_engine(exc)
+                        return
                     worker_execution_completed = False
                     logger.error(
                         "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
@@ -866,6 +911,9 @@ class DiffusionEngine:
                     # The runner may already have retired terminal state. Publish
                     # that transition before delivering controls queued during execution.
                     with self._cv:
+                        if getattr(self.scheduler, "async_kv", False):
+                            self.scheduler.finish_kv_transfer(runner_output)
+                        self._update_kv_poll_backoff(sched_output)
                         finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
                     self._process_rpc_queue()
                     self._emit_outputs(
@@ -883,7 +931,12 @@ class DiffusionEngine:
                     # on the next iteration. Do not mutate the shared result.
                     del runner_output
 
-                if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
+                # KV capabilities are optional for custom schedulers.
+                if (
+                    not getattr(self.scheduler, "async_kv", False)
+                    and not sched_output.scheduled_request_ids
+                    and getattr(self.scheduler, "_kv_draining_requests", None)
+                ):
                     # Only exceptional in-flight receives need idle polling. New
                     # requests / aborts wake this wait immediately.
                     with self._cv:
@@ -919,8 +972,8 @@ class DiffusionEngine:
 
     def _scheduler_has_runnable_work(self) -> bool:
         with self._cv:
-            return self.scheduler.get_execution_wait_timeout(time.monotonic()) == 0.0 and not getattr(
-                self.scheduler, "_kv_draining_requests", None
+            return self.scheduler.get_execution_wait_timeout(time.monotonic()) == 0.0 and (
+                getattr(self.scheduler, "async_kv", False) or not getattr(self.scheduler, "_kv_draining_requests", None)
             )
 
     def _can_submit_batch(self) -> bool:
@@ -974,7 +1027,11 @@ class DiffusionEngine:
             # PP mode: consider scheduler + pending batches
             if self._can_submit_batch() and self.scheduler.has_requests():
                 timeout = self.scheduler.get_execution_wait_timeout(now)
-                if timeout == 0.0 and getattr(self.scheduler, "_kv_draining_requests", None):
+                if (
+                    timeout == 0.0
+                    and not getattr(self.scheduler, "async_kv", False)
+                    and getattr(self.scheduler, "_kv_draining_requests", None)
+                ):
                     timeout = 0.01
         else:
             # Sync mode
@@ -982,6 +1039,9 @@ class DiffusionEngine:
                 timeout = 1.0
             else:
                 timeout = self.scheduler.get_execution_wait_timeout(now)
+
+        if timeout == 0.0 and getattr(self, "_kv_poll_deadline", 0.0) > now:
+            timeout = self._kv_poll_deadline - now
 
         # Shared: streaming deadline calculation
         deadlines = [
@@ -1012,6 +1072,9 @@ class DiffusionEngine:
                 kv_output = getattr(runner_output, "_pp_kv_connector_output", None)
                 if kv_output is not None:
                     self.scheduler.update_kv_connector_output(kv_output)
+                if getattr(self.scheduler, "async_kv", False):
+                    self.scheduler.finish_kv_transfer(runner_output)
+                self._update_kv_poll_backoff(sched_output)
                 if deferred_aborts:
                     self.scheduler.finish_requests(list(deferred_aborts), DiffusionRequestStatus.FINISHED_ABORTED)
                     self._deferred_pipeline_aborts.difference_update(deferred_aborts)
@@ -1525,6 +1588,8 @@ class DiffusionEngine:
     def _remove_diffusion_kv_requests(self, request_ids: Iterable[str]) -> None:
         """Clear terminal Worker rows while Scheduler owns the allocations."""
 
+        if getattr(self.scheduler, "async_kv", False):
+            return  # Scheduler retains pages until the piggyback cleanup ACK.
         od_config = getattr(self, "od_config", None)
         if od_config is None or not is_scheduler_paged_kv_mode(
             getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1590,12 +1655,67 @@ class DiffusionEngine:
             raise
 
     def _poll_native_kv(self, *, drain_request_ids: list[str] | None = None) -> None:
+        if getattr(self.scheduler, "async_kv", False):
+            return
         poll = getattr(self.scheduler, "native_kv_poll_output", None)
         if poll is None:
             return
         output = poll(drain_request_ids=drain_request_ids)
         if output is not None:
             self._prepare_kv_for_forward(output)
+
+    def _execute_scheduled_step(self, output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        if not getattr(self.scheduler, "async_kv", False):
+            self._prepare_kv_for_forward(output)
+            # Explicit preparation already consumed the connector submission.
+            # Keep the legacy speculative job for synchronous full forwards.
+            prepared = output
+            if getattr(output, "has_nonblocking_kv_work", False):
+                prepared = replace(
+                    output,
+                    kv_connector_metadata=None,
+                    kv_prefetch_connector_metadata=None,
+                    kv_transfer_request_ids=set(),
+                    kv_prefetch_request_ids=set(),
+                    kv_required_request_ids=None,
+                    kv_poll_only=False,
+                    kv_finished_request_ids=set(),
+                )
+            result = self.execute_fn(prepared) if output.scheduled_request_ids else BatchRunnerOutput.from_list([])
+            self._poll_native_kv()
+            return result
+        if self.execution_mode == DiffusionExecutionMode.STEP_BATCH or not output.scheduled_request_ids:
+            return self.executor.execute_step(output)
+        # Request-mode has no in-flight PP microbatches. Its no-forward step
+        # handles maintenance, then the ordinary request batch consumes ready KV.
+        kv_result = None
+        if output.has_nonblocking_kv_work:
+            kv_result = self.executor.execute_step(
+                replace(
+                    output,
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=CachedRequestData.make_empty(),
+                )
+            )
+            output = replace(output, kv_prefetch_job=None, finished_req_ids=set())
+        result = self.execute_fn(output)
+        if isinstance(kv_result, BatchRunnerOutput):
+            kv_result.runner_outputs = [
+                item for rid in output.scheduled_request_ids if (item := result.get_request_output(rid)) is not None
+            ]
+            kv_result.__post_init__()
+            return kv_result
+        return result
+
+    def _update_kv_poll_backoff(self, output: DiffusionSchedulerOutput) -> None:
+        if not getattr(self.scheduler, "async_kv", False):
+            return
+        if output.num_scheduled_reqs:
+            self._kv_poll_delay = 0.0002
+            self._kv_poll_deadline = 0.0
+        else:
+            self._kv_poll_deadline = time.monotonic() + self._kv_poll_delay
+            self._kv_poll_delay = min(0.001, self._kv_poll_delay * 2.5)
 
     def _fail_engine(self, exc: Exception) -> None:
         with self._cv:
@@ -1631,6 +1751,8 @@ class DiffusionEngine:
         self._shutdown_complete = True
 
     def _cleanup_stepwise_requests(self, request_ids: Iterable[str]) -> None:
+        if getattr(self.scheduler, "async_kv", False):
+            return  # terminal state travels with the next scheduler output
         finished = set(request_ids)
         if not finished or self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
             return
@@ -2100,17 +2222,14 @@ class DiffusionEngine:
                 # within _dummy_run, only one request will be scheduled
                 request_id = target_request_id
                 try:
-                    self._prepare_kv_for_forward(sched_output)
-                    runner_output: BaseRunnerOutput = (
-                        self.execute_fn(sched_output)
-                        if sched_output.scheduled_request_ids
-                        else BatchRunnerOutput.from_list([])
-                    )
-                    self._poll_native_kv()
+                    runner_output = self._execute_scheduled_step(sched_output)
                 except EngineDeadError:
                     raise
                 except Exception as exc:
                     if self._closed:
+                        raise
+                    if getattr(sched_output, "has_nonblocking_kv_work", False):
+                        self._fail_engine(exc)
                         raise
                     logger.error("Execution failed for diffusion request %s", request_id, exc_info=True)
                     runner_output = RunnerOutput(
@@ -2121,6 +2240,13 @@ class DiffusionEngine:
                     )
 
                 self._process_aborts_queue()
+
+                if getattr(self.scheduler, "async_kv", False):
+                    self.scheduler.finish_kv_transfer(runner_output)
+                self._update_kv_poll_backoff(sched_output)
+                if getattr(self.scheduler, "async_kv", False) and not sched_output.num_scheduled_reqs:
+                    with self._cv:
+                        self._cv.wait(timeout=max(0.0, self._kv_poll_deadline - time.monotonic()))
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
 
@@ -2564,7 +2690,7 @@ class DiffusionEngine:
         else:
             self._loop_started = False
 
-        if getattr(self.scheduler, "_native_prefetch_enabled", False):
+        if getattr(self.scheduler, "async_kv", False) or getattr(self.scheduler, "_native_prefetch_enabled", False):
             # No new schedules after the busy loop exits. Finish outstanding
             # writes before shutting down consumers and releasing reservations.
             self._poll_native_kv(drain_request_ids=list(self.scheduler._kv_loading_request_ids))
@@ -2637,6 +2763,7 @@ class DiffusionEngine:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
         if (
             not self._pipeline_async_enabled
+            and not getattr(self.scheduler, "async_kv", False)
             and getattr(self, "execution_mode", None) == DiffusionExecutionMode.STEP_BATCH
             and request_ids
         ):

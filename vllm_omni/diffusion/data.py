@@ -2319,6 +2319,7 @@ class RpcReply:
     rpc_id: str
     result: Any = None
     error: str | None = None
+    kv_rank: int | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):

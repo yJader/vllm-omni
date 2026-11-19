@@ -1289,7 +1289,20 @@ class DiffusionWorker:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        kv_output = (
+            self.model_runner.poll_kv_transfers(scheduler_output) if scheduler_output.has_nonblocking_kv_work else None
+        )
+        if kv_output is not None and not scheduler_output.scheduled_request_ids:
+            for request_id in scheduler_output.finished_req_ids:
+                self._step_lora_state.pop(request_id, None)
+            return kv_output
         self._activate_step_lora(scheduler_output)
+        if kv_output is not None:
+            from dataclasses import replace
+
+            # Maintenance already submitted the receive and retired old rows.
+            # A full-forward fallback must not submit the same legacy prefetch.
+            scheduler_output = replace(scheduler_output, kv_prefetch_job=None, finished_req_ids=set())
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         try:
@@ -1317,6 +1330,10 @@ class DiffusionWorker:
         self._finish_flashinfer_tuning(finished_ids, completed=True)
         if profiler:
             profiler.step()
+        if kv_output is not None:
+            kv_output.runner_outputs = output.runner_outputs
+            kv_output.__post_init__()
+            return kv_output
         return output
 
     def release_step_requests(self, request_ids: list[str]) -> None:
@@ -1664,11 +1681,19 @@ class DiffusionWorker:
                     mgr.close()
             except Exception:
                 logger.exception("Failed to close diffusion KV transfer manager during shutdown")
+                self.model_runner = model_runner
+                self._shutdown_complete = False
+                raise
 
         try:
             shutdown_kv_connector()
         except Exception:
             logger.exception("Failed to shutdown diffusion KV connector")
+            # Inline Workers keep the process alive. A failed stop cannot
+            # release destination storage that remote writes may still use.
+            self.model_runner = model_runner
+            self._shutdown_complete = False
+            raise
 
         try:
             a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
@@ -2175,7 +2200,10 @@ class WorkerProc:
         try:
             kv_output = None
             args = rpc_request.get("args", ())
-            if rpc_request["method"] == "execute_stepwise" and args:
+            async_kv = rpc_request["method"] == "execute_stepwise" and bool(
+                args and getattr(args[0], "has_nonblocking_kv_work", False)
+            )
+            if rpc_request["method"] == "execute_stepwise" and args and not async_kv:
                 # Fold KV receive into this PP RPC instead of draining the
                 # pipeline for a separate Engine control-plane round trip.
                 completed_ranks = getattr(self, "_kv_receive_completed_ranks", {})
@@ -2204,12 +2232,21 @@ class WorkerProc:
                 # PP0 done: entry readiness with None result
                 self._enqueue_result(RpcReply(rpc_id=reply_roles["entry"], result=None))
 
-            if is_last_stage_leader and self.result_mq is not None:
+            if (is_last_stage_leader or async_kv) and self.result_mq is not None:
+                if async_kv and not is_last_stage_leader:
+                    from dataclasses import replace
+
+                    assert isinstance(result, BatchRunnerOutput)
+                    result = replace(result, runner_outputs=[])
                 if isinstance(result, BaseRunnerOutput) and kv_output is not None:
                     # Carry Scheduler-owned completion bookkeeping in the
                     # existing step result, preserving both Future payloads.
                     setattr(result, "_pp_kv_connector_output", kv_output)
-                reply = RpcReply(rpc_id=reply_roles["result"], result=result)
+                reply = RpcReply(
+                    rpc_id=reply_roles["result"],
+                    result=result,
+                    kv_rank=self.gpu_id if async_kv else None,
+                )
                 if (
                     self._async_output_queue is not None
                     and not self.od_config.streaming_output

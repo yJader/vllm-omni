@@ -270,6 +270,7 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
         device=runner.device,
     )
     runner.kv_transfer_manager = SimpleNamespace(
+        consume_received_kv=lambda req: False,
         config=OmniKVCacheConfig(),
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
@@ -1317,6 +1318,7 @@ def _make_batch_runner(pipeline):
         video_output_transport=VideoOutputTransportConfig(),
     )
     runner.kv_transfer_manager = SimpleNamespace(
+        consume_received_kv=lambda req: False,
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
     )
     return runner

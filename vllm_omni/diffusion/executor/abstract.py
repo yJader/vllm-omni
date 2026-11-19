@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.sched.interface import CachedRequestData
@@ -20,6 +20,125 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+
+class _KVOutputAggregator:
+    """Count distinct ranks across steps, retaining cumulative receive ACKs.
+
+    Unlike a blind decrement, rank sets also accept KVReceiveProgress's
+    cumulative snapshots without treating repeated polls as new ACKs.
+    """
+
+    def __init__(self, world_size: int) -> None:
+        from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+
+        self.world_size = world_size
+        self._native = KVOutputAggregator(world_size)
+        self._acks: dict[tuple[str, str], set[int]] = {}
+        self._finished: set[tuple[str, str]] = set()
+        self._failed: set[str] = set()
+        self._shm_keys: dict[str, set[str]] = {}
+        self._cleaned_shm_keys: dict[str, set[str]] = {}
+        self._pending_failures: dict[str, str] = {}
+
+    def record_failures(self, output: BaseRunnerOutput) -> dict[str, str]:
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+        if not isinstance(output, BatchRunnerOutput):
+            return {}
+        for rid, keys in output.kv_shm_keys.items():
+            self._shm_keys.setdefault(rid, set()).update(set(keys) - self._cleaned_shm_keys.get(rid, set()))
+        errors = {rid: error for rid, error in output.kv_failed_req_ids.items() if rid not in self._failed}
+        self._failed.update(errors)
+        self._pending_failures.update(errors)
+        self._cleanup_shm(self._failed)
+        return errors
+
+    def _cleanup_shm(self, request_ids: set[str]) -> None:
+        from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+
+        for rid in request_ids:
+            for key in self._shm_keys.pop(rid, ()):
+                SharedMemoryConnector({}).cleanup(key)
+                self._cleaned_shm_keys.setdefault(rid, set()).add(key)
+
+    def close(self) -> None:
+        """Only call after Workers have stopped accessing the shared keys."""
+        self._cleanup_shm(set(self._shm_keys))
+        self._cleaned_shm_keys.clear()
+
+    def aggregate(self, outputs: list[BaseRunnerOutput], retired: set[str]) -> BaseRunnerOutput:
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+        result = BatchRunnerOutput.from_list(
+            [item for output in outputs if isinstance(output, BatchRunnerOutput) for item in output.runner_outputs]
+        )
+        native_finished: set[str] = set()
+        native_sent: set[str] = set()
+        native_outputs: list[ModelRunnerOutput] = []
+        for rank, output in enumerate(outputs):
+            if not isinstance(output, BatchRunnerOutput):
+                raise TypeError("KV steps require BatchRunnerOutput on every rank")
+            self.record_failures(output)
+            native = output.kv_connector_output
+            if native is not None and native.invalid_block_ids:
+                raise RuntimeError("Diffusion KV connector reported invalid remote pages")
+            native_outputs.append(
+                ModelRunnerOutput(
+                    req_ids=[],
+                    req_id_to_index={},
+                    sampled_token_ids=[],
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    kv_connector_output=replace(native, finished_recving=None, finished_sending=None)
+                    if native
+                    else None,
+                )
+            )
+            for kind, ids, destination in (
+                ("native", native.finished_recving or () if native is not None else (), native_finished),
+                ("sent", native.finished_sending or () if native is not None else (), native_sent),
+                ("legacy", output.kv_finished_req_ids, result.kv_finished_req_ids),
+                ("cancel", output.kv_cancelled_req_ids, result.kv_cancelled_req_ids),
+                ("cleanup", output.kv_cleaned_req_ids, result.kv_cleaned_req_ids),
+            ):
+                for rid in ids:
+                    key = (kind, rid)
+                    if key in self._finished or (kind == "legacy" and rid in self._failed):
+                        continue
+                    ranks = self._acks.setdefault(key, set())
+                    ranks.add(rank)
+                    if len(ranks) == self.world_size:
+                        self._finished.add(key)
+                        del self._acks[key]
+                        if isinstance(destination, set):
+                            destination.add(rid)
+                        else:
+                            destination.append(rid)
+        # Failure wins over a completion from another rank in the same step.
+        result.kv_finished_req_ids = [rid for rid in result.kv_finished_req_ids if rid not in self._failed]
+        result.kv_failed_req_ids = self._pending_failures
+        self._pending_failures = {}
+        if any(isinstance(out, BatchRunnerOutput) and out.kv_connector_output is not None for out in outputs):
+            merged = self._native.aggregate(native_outputs)
+            result.kv_connector_output = merged.kv_connector_output
+            result.kv_connector_output.finished_recving = native_finished
+            result.kv_connector_output.finished_sending = native_sent
+        self._cleanup_shm(set(result.kv_finished_req_ids) | self._failed | set(result.kv_cancelled_req_ids))
+        for rid in retired:
+            self._finished.discard(("native", rid))
+            self._acks.pop(("native", rid), None)
+            self._finished.discard(("sent", rid))
+            self._acks.pop(("sent", rid), None)
+        for rid in result.kv_cancelled_req_ids:
+            self._cleaned_shm_keys.pop(rid, None)
+            self._failed.discard(rid)
+            for kind in ("legacy", "cancel"):
+                self._finished.discard((kind, rid))
+                self._acks.pop((kind, rid), None)
+        for rid in result.kv_cleaned_req_ids:
+            self._finished.discard(("cleanup", rid))
+        return result
 
 
 def _prepare_kv_for_forward_local(
@@ -116,6 +235,8 @@ class DiffusionExecutor(ABC):
     """Abstract base class for Diffusion executors."""
 
     uses_multiproc: bool = False
+    supports_async_kv: bool = False
+    kv_failure_callback: Callable[[dict[str, str]], None] | None = None
 
     @staticmethod
     def get_class(od_config: OmniDiffusionConfig) -> type[DiffusionExecutor]:

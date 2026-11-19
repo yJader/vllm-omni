@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from vllm.v1.outputs import KVConnectorOutput
+
     from vllm_omni.diffusion.attention.schedule import AttentionSchedule, AttentionSigmaSchedule
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.interaction.types import (
@@ -234,6 +236,14 @@ class RunnerOutput(BaseRunnerOutput):
 @dataclass
 class BatchRunnerOutput(BaseRunnerOutput):
     runner_outputs: list[RunnerOutput]
+    kv_connector_output: KVConnectorOutput | None = None
+    kv_finished_req_ids: list[str] = field(default_factory=list)
+    kv_failed_req_ids: dict[str, str] = field(default_factory=dict)
+    kv_cancelled_req_ids: list[str] = field(default_factory=list)
+    kv_cleaned_req_ids: list[str] = field(default_factory=list)
+    # SHM keys are published before starting a background read, so even a
+    # failed receive can be reclaimed by the executor without a Worker RPC.
+    kv_shm_keys: dict[str, list[str]] = field(default_factory=dict)
     _id_to_idx: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:

@@ -23,6 +23,7 @@ class DiffusionRequestStatus(enum.IntEnum):
     """Request status tracked by diffusion scheduler."""
 
     WAITING = enum.auto()
+    WAITING_FOR_KV = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
 
@@ -271,10 +272,10 @@ class CachedRequestData:
 
 
 class KVPrefetchJob(TypedDict):
-    """Descriptor for prefetching the next request's received KV cache."""
+    """Descriptor for a background KV receive, independent of model admission."""
 
     request_id: str
-    kv_sender_info: dict[str, Any]
+    kv_sender_info: dict[str, Any] | None
 
 
 @dataclass
@@ -292,7 +293,7 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # Execution mode only; the worker owns the packed tensor layout.
     use_mixfusion: bool = False
-    # next request to background-prefetch KV
+    # One background receive to submit this cycle; earlier jobs may remain in flight.
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None
     kv_transfer_request_ids: set[str] = field(default_factory=set)
@@ -308,6 +309,24 @@ class DiffusionSchedulerOutput:
     # A single host-selected boundary decision is delivered to every Worker.
     step_resumes: dict[str, Literal["interaction", "timeout"]] = field(default_factory=dict)
     interaction_boundaries: dict[str, InteractionBoundaryContext] = field(default_factory=dict)
+
+    @property
+    def has_nonblocking_kv_work(self) -> bool:
+        """Submit/poll through the ordinary step, collecting every rank's ACK.
+
+        None and nonempty required IDs retain the synchronous preparation
+        contract. Terminal notifications in a nonblocking step also carry
+        cancellation/cleanup, even when there is no model work left.
+        """
+        return self.kv_required_request_ids == set() and bool(
+            self.kv_connector_metadata is not None
+            or self.kv_prefetch_connector_metadata is not None
+            or self.kv_prefetch_job is not None
+            or self.kv_transfer_request_ids
+            or self.kv_poll_only
+            or self.finished_req_ids
+            or self.kv_finished_request_ids
+        )
 
     @property
     def has_sync_kv_loads(self) -> bool:
@@ -338,4 +357,5 @@ class DiffusionSchedulerOutput:
             and self.kv_prefetch_connector_metadata is None
             and not self.kv_required_request_ids
             and not self.kv_poll_only
+            and not self.has_nonblocking_kv_work
         )

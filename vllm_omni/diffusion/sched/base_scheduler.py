@@ -100,6 +100,11 @@ class BaseScheduler(ABC):
         self._kv_received_request_ids: set[str] = set()
         self._native_prefetch_enabled = False
         self._native_prefetch_request_id: str | None = None
+        self.async_kv = False
+        self._pending_kv_loads: dict[str, KVPrefetchJob] = {}
+        self._legacy_kv_loading: set[str] = set()
+        self._legacy_kv_requests: set[str] = set()
+        self._kv_cleanup_inflight: set[str] = set()
 
     def initialize(
         self,
@@ -194,12 +199,34 @@ class BaseScheduler(ABC):
             )
         except (TypeError, ValueError) as exc:
             raise InvalidAttentionScheduleError(str(exc)) from exc
-        if request_id in self._request_states or request_id in self._kv_draining_requests:
+        if (
+            request_id in self._request_states
+            or request_id in self._kv_draining_requests
+            or request_id in self._legacy_kv_requests
+            or any(
+                kv_request.request_id in self._kv_finished_request_ids
+                for kv_request in (request.diffusion_kv_requests or ())
+            )
+        ):
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
         state.queued_at = time.perf_counter()
         self._request_states[request_id] = state
         self._waiting.append(request_id)
+        omni_kv = getattr(self.od_config, "omni_kv_config", None) or {}
+        if (
+            self.async_kv
+            and self._kv_connector is None
+            and omni_kv.get("need_recv_cache", False)
+            and not request.is_dummy_run_request_id(request_id)
+        ):
+            state.status = DiffusionRequestStatus.WAITING_FOR_KV
+            self._legacy_kv_loading.add(request_id)
+            self._legacy_kv_requests.add(request_id)
+            self._pending_kv_loads[request_id] = {
+                "request_id": request_id,
+                "kv_sender_info": request.kv_sender_info,
+            }
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
         return request_id
 
@@ -231,6 +258,9 @@ class BaseScheduler(ABC):
             if state is None:
                 self._waiting.popleft()
                 continue
+            if state.status == DiffusionRequestStatus.WAITING_FOR_KV:
+                deferred.append(self._waiting.popleft())
+                continue
             if not self._can_schedule_waiting(state):
                 break
 
@@ -240,8 +270,17 @@ class BaseScheduler(ABC):
                 if already_reserved:
                     diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
                 else:
+                    remote_kv = self._kv_connector is not None and any(
+                        request.kv_transfer_params for request in state.diffusion_kv_requests
+                    )
+                    # Preserve A-complete-before-B-submission. A speculative
+                    # transfer may reserve pages only after the current load
+                    # has been acknowledged by every rank.
+                    if self.async_kv and remote_kv and self._kv_loading_request_ids:
+                        deferred.append(self._waiting.popleft())
+                        continue
                     matched_tokens: list[int] = []
-                    if self._kv_connector is not None:
+                    if self._kv_connector is not None and (remote_kv or not self.async_kv):
                         for request in state.diffusion_kv_requests:
                             num_tokens, _ = self._kv_connector.get_num_new_matched_tokens(request, 0)
                             if num_tokens is None:
@@ -272,7 +311,7 @@ class BaseScheduler(ABC):
                         break
                     diffusion_kv_metadata = allocation
                     self._kv_request_generations[request_id] = allocation.allocation_generation
-                    if self._kv_connector is not None:
+                    if self._kv_connector is not None and (remote_kv or not self.async_kv):
                         try:
                             transfer_ids = commit_kv_load(
                                 self._kv_connector,
@@ -292,6 +331,10 @@ class BaseScheduler(ABC):
                             self._kv_loading_request_ids.add(request_id)
                         for sequence, request in zip(allocation.sequences, state.diffusion_kv_requests, strict=True):
                             sequence.num_computed_tokens = request.num_computed_tokens
+                if self.async_kv and request_id in self._kv_loading_request_ids:
+                    state.status = DiffusionRequestStatus.WAITING_FOR_KV
+                    deferred.append(self._waiting.popleft())
+                    continue
 
             self._waiting.popleft()
             if request_id == self._native_prefetch_request_id:
@@ -320,7 +363,7 @@ class BaseScheduler(ABC):
         # one already finished/aborted (would consume its sender buffer for
         # nothing).
         kv_prefetch_job: KVPrefetchJob | None = None
-        if self._prefetch_enabled and self._waiting:
+        if self._prefetch_enabled and not self.async_kv and self._waiting:
             nxt = self._request_states.get(self._waiting[0])
             if nxt is not None and not nxt.is_finished():
                 sender_info = getattr(nxt.req, "kv_sender_info", None)
@@ -342,7 +385,9 @@ class BaseScheduler(ABC):
             kv_finished_request_ids=set(self._kv_finished_request_ids),
         )
         if self._kv_connector is not None and (
-            self._kv_transfer_request_ids or self._kv_finished_request_ids or self._kv_draining_requests
+            self._kv_transfer_request_ids
+            or self._kv_finished_request_ids
+            or (self._kv_draining_requests and not self.async_kv)
         ):
             scheduler_output.kv_connector_metadata = self._kv_connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_transfer_request_ids = self._kv_transfer_request_ids
@@ -352,7 +397,8 @@ class BaseScheduler(ABC):
             # Flush current-request metadata before staging B. Mooncake
             # batches ready requests from the same producer into one write;
             # combining A+B would make A's completion depend on B's bytes.
-            self._try_native_prefetch()
+            if not self.async_kv or not self._loading_sequence_ids(self._running):
+                self._try_native_prefetch()
             prefetch_finished_ids = self._kv_finished_request_ids - scheduler_output.kv_finished_request_ids
             if self._kv_transfer_request_ids or prefetch_finished_ids:
                 scheduler_output.kv_prefetch_connector_metadata = self._kv_connector.build_connector_meta(
@@ -365,6 +411,23 @@ class BaseScheduler(ABC):
             scheduler_output.kv_finished_request_ids.update(prefetch_finished_ids)
             scheduler_output.num_waiting_reqs = len(self._waiting)
 
+        if self.async_kv:
+            # No Worker is allowed to wait for another request's receive.
+            scheduler_output.kv_required_request_ids = set()
+            if self._pending_kv_loads:
+                request_id = next(iter(self._pending_kv_loads))
+                scheduler_output.kv_prefetch_job = self._pending_kv_loads.pop(request_id)
+            # A terminal notification retires Worker state. Native rows must
+            # survive until every rank has stopped receiving into their pages.
+            # Keep pending cleanup in Scheduler state and send it exactly once.
+            scheduler_output.finished_req_ids.difference_update(self._kv_draining_requests)
+            cleanup = self.completed_kv_drains() - self._kv_cleanup_inflight
+            scheduler_output.finished_req_ids.update(cleanup)
+            self._kv_cleanup_inflight.update(cleanup)
+            scheduler_output.kv_poll_only = bool(
+                self._kv_loading_request_ids or self._legacy_kv_loading or self._kv_cleanup_inflight
+            )
+
         # update after schedule
         self._step_id += 1
         self._finished_req_ids.clear()
@@ -372,6 +435,8 @@ class BaseScheduler(ABC):
         return scheduler_output
 
     def _try_native_prefetch(self) -> None:
+        if self.async_kv and self._kv_loading_request_ids:
+            return
         if not self._running or not self._waiting or self._native_prefetch_request_id is not None:
             return
         request_id = self._waiting[0]
@@ -427,6 +492,8 @@ class BaseScheduler(ABC):
         self._kv_transfer_request_ids.update(transfer_ids)
         if transfer_ids:
             self._kv_loading_request_ids.add(request_id)
+            if self.async_kv:
+                state.status = DiffusionRequestStatus.WAITING_FOR_KV
         for sequence, request in zip(allocation.sequences, state.diffusion_kv_requests, strict=True):
             sequence.num_computed_tokens = request.num_computed_tokens
         self._native_prefetch_request_id = request_id
@@ -468,6 +535,8 @@ class BaseScheduler(ABC):
             or self._kv_transfer_request_ids
             or self._kv_finished_request_ids
             or self._kv_draining_requests
+            or (self.async_kv and self._finished_req_ids)
+            or self._legacy_kv_loading
         )
 
     def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
@@ -497,6 +566,29 @@ class BaseScheduler(ABC):
             if internal_ids and internal_ids.issubset(self._kv_received_request_ids):
                 self._kv_loading_request_ids.discard(request_id)
                 self._kv_received_request_ids.difference_update(internal_ids)
+                if state.status == DiffusionRequestStatus.WAITING_FOR_KV:
+                    state.status = DiffusionRequestStatus.WAITING
+
+    def finish_kv_transfer(self, output: BaseRunnerOutput) -> None:
+        """Apply only executor-aggregated completions, including cleanup ACKs."""
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+        if not isinstance(output, BatchRunnerOutput):
+            return
+        self.update_kv_connector_output(output.kv_connector_output)
+        for rid in output.kv_finished_req_ids:
+            self._legacy_kv_loading.discard(rid)
+            state = self._request_states.get(rid)
+            if state is not None and state.status == DiffusionRequestStatus.WAITING_FOR_KV:
+                state.status = DiffusionRequestStatus.WAITING
+        if output.kv_failed_req_ids:
+            self._finish_requests(
+                dict.fromkeys(output.kv_failed_req_ids, DiffusionRequestStatus.FINISHED_ERROR),
+                {rid: error for rid, error in output.kv_failed_req_ids.items()},
+            )
+        self._legacy_kv_loading.difference_update(output.kv_cancelled_req_ids)
+        self._legacy_kv_requests.difference_update(output.kv_cancelled_req_ids)
+        self.release_kv_drains(set(output.kv_cleaned_req_ids) & self._kv_cleanup_inflight)
 
     def fail_incomplete_kv_loads(self, transfer_ids: set[str]) -> set[str]:
         statuses = {}
@@ -517,6 +609,7 @@ class BaseScheduler(ABC):
             state = self._kv_draining_requests[request_id]
             self._release_request_kv(state, state.status)
             del self._kv_draining_requests[request_id]
+            self._kv_cleanup_inflight.discard(request_id)
             if request_id not in self._request_states:
                 self._kv_request_generations.pop(request_id, None)
 
@@ -614,6 +707,10 @@ class BaseScheduler(ABC):
         self._kv_received_request_ids.clear()
         self._kv_request_generations.clear()
         self._native_prefetch_request_id = None
+        self._pending_kv_loads.clear()
+        self._legacy_kv_loading.clear()
+        self._legacy_kv_requests.clear()
+        self._kv_cleanup_inflight.clear()
 
     def _shutdown_diffusion_kv(self) -> None:
         """Stop transfers before releasing their cache and request state."""
@@ -661,7 +758,14 @@ class BaseScheduler(ABC):
             status = statuses[request_id]
             if request_id == self._native_prefetch_request_id:
                 self._native_prefetch_request_id = None
-            if request_id in self._kv_loading_request_ids:
+            if request_id in self._legacy_kv_requests:
+                self._pending_kv_loads.pop(request_id, None)
+                self._legacy_kv_loading.add(request_id)
+            if request_id in self._kv_loading_request_ids or (
+                self.async_kv
+                and self._diffusion_kv_manager is not None
+                and self._diffusion_kv_manager.has_request(request_id)
+            ):
                 self._kv_draining_requests[request_id] = state
             else:
                 self._release_request_kv(state, status)
@@ -678,6 +782,8 @@ class BaseScheduler(ABC):
         request_id = state.request_id
         if self._kv_connector is not None:
             for request in state.diffusion_kv_requests:
+                if self.async_kv and not request.kv_transfer_params:
+                    continue
                 request.status = (
                     RequestStatus.FINISHED_ABORTED
                     if status == DiffusionRequestStatus.FINISHED_ABORTED

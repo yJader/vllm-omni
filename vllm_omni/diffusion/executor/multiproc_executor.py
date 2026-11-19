@@ -30,7 +30,7 @@ from vllm_omni.diffusion.data import (
     DiffusionOutput,
     uses_rank_local_dp_concurrency,
 )
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor, PipelineStepFutures
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor, PipelineStepFutures, _KVOutputAggregator
 from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.sched.request_scheduler import (
@@ -130,6 +130,7 @@ class _ExecutorShutdownCleaner:
 
 class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
     uses_multiproc: bool = True
+    supports_async_kv: bool = True
 
     # Class-level defaults so tests using object.__new__ (without _init_executor)
     # don't hit AttributeError when collective_rpc accesses these.
@@ -182,6 +183,10 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         self._rpc_id_counter = 0
         self._rpc_id_lock = threading.Lock()
         self._rpc_futures: dict[str, concurrent.futures.Future[AsyncDiffusionOutput]] = {}
+        self._kv_aggregator = _KVOutputAggregator(num_workers)
+        self._kv_step_reports: OrderedDict[str, tuple[DiffusionSchedulerOutput, dict[int, BaseRunnerOutput]]] = (
+            OrderedDict()
+        )
         self._output_futures: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._completed_outputs: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._batch_split_map: dict[str, dict[str, str]] = {}  # batch_id -> {per_req_id: request_id}
@@ -751,6 +756,8 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()
+        if scheduler_output.has_nonblocking_kv_work:
+            return self.submit_step(scheduler_output).step_done.result(timeout=_DLO_DP_WAVE_TIMEOUT_S)
         try:
             result = self.collective_rpc(
                 "execute_stepwise",
@@ -777,6 +784,8 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         When PP=1, both complete together (fallback to synchronous execute_step).
         """
         self._ensure_open()
+        if not self._pump_running:
+            self._start_result_pump()
 
         # Allocate independent rpc_ids for entry and result roles
         ids = {"entry": self._next_rpc_id(), "result": self._next_rpc_id()}
@@ -788,6 +797,8 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         with self._futures_lock:
             for rpc_id, fut in futs.items():
                 self._rpc_futures[rpc_id] = fut
+            if getattr(scheduler_output, "has_nonblocking_kv_work", False):
+                self._kv_step_reports[ids["result"]] = (scheduler_output, {})
 
         try:
             self._broadcast_mq.enqueue(
@@ -805,6 +816,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             with self._futures_lock:
                 for rpc_id in ids.values():
                     self._rpc_futures.pop(rpc_id, None)
+                self._kv_step_reports.pop(ids["result"], None)
             raise
 
         # Chain step_done -> pp0_done as a fallback (e.g., PP=1 or entry reply lost)
@@ -818,6 +830,16 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                     try_set_result(entry_fut, None)
 
         futs[ids["result"]].add_done_callback(_chain_completion)
+        if getattr(scheduler_output, "has_nonblocking_kv_work", False):
+            # Missing cleanup/rank ACKs must not pin pages forever. The Engine
+            # handles this exception through its existing fail-closed shutdown.
+            timer = threading.Timer(
+                _DLO_DP_WAVE_TIMEOUT_S,
+                lambda: try_set_exception(futs[ids["result"]], TimeoutError("Missing diffusion KV step ACK")),
+            )
+            timer.daemon = True
+            timer.start()
+            futs[ids["result"]].add_done_callback(lambda _: timer.cancel())
 
         return PipelineStepFutures(pp0_done=futs[ids["entry"]], step_done=futs[ids["result"]])
 
@@ -1018,6 +1040,60 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                     except Exception:
                         logger.exception("SHM unpack failed for RpcReply rpc_id=%s", msg.rpc_id)
                         msg = RpcReply(rpc_id=msg.rpc_id, error="SHM unpack failed")
+
+                if msg.kv_rank is not None and msg.error is None:
+                    kv_rank = msg.kv_rank
+                    with self._futures_lock:
+                        errors = self._kv_aggregator.record_failures(msg.result)
+                    # Do not take the Engine condition while holding the
+                    # futures lock: submission holds those in reverse order.
+                    if errors and self.kv_failure_callback is not None:
+                        self.kv_failure_callback(errors)
+                    deliveries: list[
+                        tuple[concurrent.futures.Future[BaseRunnerOutput], BaseRunnerOutput | None, Exception | None]
+                    ] = []
+                    with self._futures_lock:
+                        pending = self._kv_step_reports.get(msg.rpc_id)
+                        if pending is None:
+                            continue  # shutdown or a failed wave already retired
+                        _, reports = pending
+                        if not 0 <= kv_rank < self._kv_aggregator.world_size or kv_rank in reports:
+                            msg = RpcReply(rpc_id=msg.rpc_id, error="Invalid/duplicate diffusion KV rank ACK")
+                        else:
+                            reports[kv_rank] = msg.result
+                            # Process waves in submission order: retirement must
+                            # not precede a slow rank's older receive snapshot.
+                            while self._kv_step_reports:
+                                rpc_id, (output, reports) = next(iter(self._kv_step_reports.items()))
+                                if len(reports) != self._kv_aggregator.world_size:
+                                    break
+                                del self._kv_step_reports[rpc_id]
+                                future = cast(
+                                    concurrent.futures.Future[BaseRunnerOutput] | None,
+                                    self._rpc_futures.pop(rpc_id, None),
+                                )
+                                if future is None:
+                                    continue
+                                try:
+                                    merged = self._kv_aggregator.aggregate(
+                                        [reports[rank] for rank in range(self._kv_aggregator.world_size)],
+                                        output.kv_finished_request_ids,
+                                    )
+                                except Exception as aggregation_error:
+                                    deliveries.append((future, None, aggregation_error))
+                                else:
+                                    deliveries.append((future, merged, None))
+                    # Future callbacks may acquire the Engine condition.
+                    # They must run outside _futures_lock, as in the ordinary
+                    # two-phase reply path below.
+                    for future, merged_result, error in deliveries:
+                        if error is not None:
+                            try_set_exception(future, error)
+                        else:
+                            assert merged_result is not None
+                            try_set_result(future, merged_result)
+                    if msg.error is None:
+                        continue
 
                 with self._futures_lock:
                     fut = self._rpc_futures.pop(msg.rpc_id, None)
@@ -1246,6 +1322,8 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                     if not fut.done():
                         try_set_exception(fut, RuntimeError("Executor shut down"))
                 self._rpc_futures.clear()
+                if hasattr(self, "_kv_step_reports"):
+                    self._kv_step_reports.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
                 # Cached async outputs hold unpacked tensors; drop them so they
@@ -1254,4 +1332,6 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                 self._dropped_output_ids.clear()
             self._processes = (cleaner.processes or []) if cleaner is not None else []
             if not self._processes:
+                if hasattr(self, "_kv_aggregator"):
+                    self._kv_aggregator.close()
                 self._shutdown_cleaner = None

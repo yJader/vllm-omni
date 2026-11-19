@@ -95,6 +95,9 @@ class KVReceiveProgress:
             # post_forward also consumes get_finished(); always retain its
             # events, including completions for a request not required yet.
             result = active_connector.post_forward(output.kv_finished_request_ids)
+            if getattr(result, "failed_recving", None):
+                # A connector failure is not proof that remote writes stopped.
+                raise RuntimeError(f"Diffusion KV receive failed: {result.failed_recving}")
             # Cancelling a request before admission can send a zero-page
             # notification to release its producer. Its late acknowledgement
             # has no receive reservation and must not become a leaked record.
