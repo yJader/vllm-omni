@@ -3076,11 +3076,21 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             else None,
         )
 
+    def _iter_local_decoder_layers(self):
+        """Yield decoder layers hosted by this PP stage (skipping PPMissingLayer)."""
+        model = self.model.model
+        layers = model.layers
+        start_layer = getattr(model, "start_layer", 0)
+        end_layer = getattr(model, "end_layer", len(layers))
+        for layer in layers[start_layer:end_layer]:
+            if not isinstance(layer, PPMissingLayer):
+                yield layer
+
     # ==========================================================
     # Keep Negative KV Only
     # ==========================================================
     def _keep_negative_kv_only(self):
-        for layer in self.model.model.layers:
+        for layer in self._iter_local_decoder_layers():
             mgr = layer.self_attn.image_attn
             mgr._injected_ar_kv = [mgr._injected_ar_kv[1]]
 
@@ -3165,8 +3175,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             return input_ids, 0
 
         # Sampled tokens can extend beyond the prefix actually computed by
-        # AR. Every decoder layer must have KV for the prefix we remove.
-        for layer in self.model.model.layers:
+        # AR. Every local decoder layer must have KV for the prefix we remove.
+        for layer in self._iter_local_decoder_layers():
             layer_kv = ar_kv_data.get(layer.layer_idx)
             if layer_kv is None or layer_kv.get("key") is None or layer_kv.get("value") is None:
                 raise ValueError(f"AR KV cache is missing key/value tensors for layer {layer.layer_idx}")

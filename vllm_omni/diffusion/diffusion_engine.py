@@ -1439,7 +1439,7 @@ class DiffusionEngine:
                 return
             if task.method == "pause_scheduler":
                 if self._pipeline_async_enabled:
-                    result = self._execute_control_rpc_with_drain(
+                    self._execute_control_rpc_with_drain(
                         "synchronize_device",
                         timeout=remaining,
                         kwargs={"timeout": remaining},
