@@ -1991,6 +1991,41 @@ class TestStepScheduler:
         self.scheduler: StepScheduler = StepScheduler()
         self.scheduler.initialize(_scheduler_config())
 
+    def test_pipeline_schedules_different_shape_while_first_step_is_in_flight(self) -> None:
+        self.scheduler.max_num_running_reqs = 2
+        self.scheduler.max_num_resident_reqs = 4
+        for request_id, size in (("large", 1024), ("small-1", 512), ("small-2", 512)):
+            self.scheduler.add_request(
+                _make_step_request(
+                    request_id,
+                    sampling_params=OmniDiffusionSamplingParams(height=size, width=size, num_inference_steps=4),
+                )
+            )
+
+        first = self.scheduler.schedule()
+        assert first.scheduled_request_ids == ["large"]
+        self.scheduler.mark_pipeline_inflight(first.scheduled_request_ids)
+
+        assert self.scheduler.get_execution_wait_timeout(now=0.0) == 0.0
+        second = self.scheduler.schedule()
+        assert second.scheduled_request_ids == ["small-1", "small-2"]
+        self.scheduler.mark_pipeline_inflight(second.scheduled_request_ids)
+
+        self.scheduler.update_from_output(first, _make_step_output("large", step_index=1))
+        self.scheduler.pipeline_step_completed(first.scheduled_request_ids)
+        self.scheduler.update_from_output(
+            second,
+            BatchRunnerOutput.from_list(
+                [_make_step_output(request_id, step_index=1) for request_id in second.scheduled_request_ids]
+            ),
+        )
+        self.scheduler.pipeline_step_completed(second.scheduled_request_ids)
+
+        continuation = self.scheduler.schedule()
+        assert continuation.scheduled_request_ids == ["large"]
+        self.scheduler.mark_pipeline_inflight(continuation.scheduled_request_ids)
+        assert self.scheduler.schedule().scheduled_request_ids == ["small-1", "small-2"]
+
     def test_admission_wait_is_not_supported(self) -> None:
         decision = self.scheduler.get_admission_wait_decision(
             now=10.0,

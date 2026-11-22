@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import inf
 from typing import TYPE_CHECKING, Any, Literal
@@ -70,14 +71,11 @@ class StepScheduler(BaseScheduler):
             for rid in self._running
             if not self._request_progress[rid].pipeline_step_inflight
         ]
-        runnable_count = sum(progress.wait_deadline is None for progress in runnable)
-        if runnable_count:
+        if any(progress.wait_deadline is None for progress in runnable):
             return 0.0
         resident_capacity = self.max_num_resident_reqs or self.max_num_running_reqs
-        if (
-            len(self._running) < resident_capacity
-            and runnable_count < self.max_num_running_reqs
-            and any(self._can_schedule_waiting(self._request_states[request_id]) for request_id in self._waiting)
+        if len(self._running) < resident_capacity and any(
+            self._can_add_to_batch(self._request_states[request_id], ()) for request_id in self._waiting
         ):
             return 0.0
         if (
@@ -153,19 +151,36 @@ class StepScheduler(BaseScheduler):
         )
         return request_id
 
-    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
-        if not super()._can_schedule_waiting(state):
+    def _can_add_to_batch(self, state: SchedulerRequestState, selected_ids: Sequence[str]) -> bool:
+        if self.max_num_resident_reqs is None:
+            return super()._can_add_to_batch(state, selected_ids)
+
+        # Async PP can keep several independent batches resident.
+        if not selected_ids:
+            return self._mixfusion_compatible(state, selected_ids)
+        key = self._request_states[selected_ids[0]].sampling_params_key
+        if key is None or key != state.sampling_params_key:
             return False
+        return self._mixfusion_compatible(state, selected_ids) and self._step_phases_compatible(state, selected_ids)
 
-        if state.req.mixfusion_info is not None:
-            candidates = [
-                info for rid in self._running if (info := self._request_states[rid].req.mixfusion_info) is not None
-            ] + [state.req.mixfusion_info]
-            if not fits_chunk_budget(candidates):
-                return False
+    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
+        return (
+            super()._can_schedule_waiting(state)
+            and self._mixfusion_compatible(state, self._running)
+            and self._step_phases_compatible(state, self._running)
+        )
 
+    def _mixfusion_compatible(self, state: SchedulerRequestState, peer_ids: Sequence[str]) -> bool:
+        if state.req.mixfusion_info is None:
+            return True
+        candidates = [
+            info for rid in peer_ids if (info := self._request_states[rid].req.mixfusion_info) is not None
+        ] + [state.req.mixfusion_info]
+        return fits_chunk_budget(candidates)
+
+    def _step_phases_compatible(self, state: SchedulerRequestState, peer_ids: Sequence[str]) -> bool:
         is_first_step = self._request_progress[state.request_id].current_step == 0
-        for request_id in self._running:
+        for request_id in peer_ids:
             running = self._request_states[request_id]
             if state.req.allow_mixed_step_phases and running.req.allow_mixed_step_phases:
                 continue
