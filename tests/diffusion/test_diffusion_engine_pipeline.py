@@ -9,7 +9,6 @@ import queue
 import threading
 import time
 from collections import deque
-from types import SimpleNamespace
 
 import pytest
 
@@ -46,14 +45,17 @@ class _PipelineExecutor:
 
 def _make_engine(loop: asyncio.AbstractEventLoop, *, max_concurrent_batches: int = 2) -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
-    engine.od_config = SimpleNamespace(
+    engine.od_config = OmniDiffusionConfig(
+        model="test",
+        max_num_seqs=1,
+        max_concurrent_batches=max_concurrent_batches,
         streaming_output=False,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        parallel_config={"pipeline_parallel_size": 2},
         diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
     )
     engine.executor = _PipelineExecutor()
     engine.scheduler = StepScheduler()
-    engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+    engine.scheduler.initialize(engine.od_config)
     engine.scheduler.max_num_resident_reqs = max_concurrent_batches
     engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
     engine._pipeline_async_enabled = True
@@ -67,6 +69,7 @@ def _make_engine(loop: asyncio.AbstractEventLoop, *, max_concurrent_batches: int
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
+    engine._request_chunk_states = {}
     engine._unclaimed_async_outputs = {}
     engine._shutdown_output_futures = {}
     engine._closed = False
