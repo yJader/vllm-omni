@@ -2026,6 +2026,48 @@ class TestStepScheduler:
         self.scheduler.mark_pipeline_inflight(continuation.scheduled_request_ids)
         assert self.scheduler.schedule().scheduled_request_ids == ["small-1", "small-2"]
 
+    def test_pipeline_schedules_concurrent_mixfusion_batches_with_per_batch_budget(self) -> None:
+        from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+
+        self.scheduler.max_num_running_reqs = 2
+        self.scheduler.max_num_resident_reqs = 4
+
+        def _make_mf_req(req_id: str, height: int, width: int, image_tokens: int) -> OmniDiffusionRequest:
+            req = _make_step_request(
+                req_id,
+                sampling_params=OmniDiffusionSamplingParams(height=height, width=width, num_inference_steps=4),
+            )
+            req.mixfusion_info = MixFusionRequestInfo(
+                num_images=1,
+                image_tokens=image_tokens,
+                min_chunk_tokens=256,
+                max_chunks=128,
+                condition_key=(True,),
+            )
+            return req
+
+        # Batch 1: gcd(1024, 4096) = 1024 >= 256 -> compatible in one MixFusion batch.
+        self.scheduler.add_request(_make_mf_req("mf-a", 512, 512, 1024))
+        self.scheduler.add_request(_make_mf_req("mf-b", 1024, 1024, 4096))
+        # Batch 2: gcd(1024, 704) = 64 < 256 -> mf-d exceeds chunk budget with mf-c,
+        # so mf-c must run alone even though mf-a/mf-b are concurrently in flight.
+        self.scheduler.add_request(_make_mf_req("mf-c", 512, 512, 1024))
+        self.scheduler.add_request(_make_mf_req("mf-d", 448, 416, 704))
+
+        first = self.scheduler.schedule()
+        assert first.scheduled_request_ids == ["mf-a", "mf-b"]
+        assert first.use_mixfusion is True
+        self.scheduler.mark_pipeline_inflight(first.scheduled_request_ids)
+
+        second = self.scheduler.schedule()
+        assert second.scheduled_request_ids == ["mf-c"]
+        assert second.use_mixfusion is True
+        self.scheduler.mark_pipeline_inflight(second.scheduled_request_ids)
+
+        third = self.scheduler.schedule()
+        assert third.scheduled_request_ids == ["mf-d"]
+        assert third.use_mixfusion is True
+
     def test_admission_wait_is_not_supported(self) -> None:
         decision = self.scheduler.get_admission_wait_decision(
             now=10.0,

@@ -257,17 +257,18 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
         cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
         if cfg_parallel_ready:
             # Each PP pipeline carries exactly one CFG branch determined by cfg_rank.
-            all_kwargs: list[dict[str, Any] | None] = [
-                positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs
+            branch_name = "positive" if get_classifier_free_guidance_rank() == 0 else "negative"
+            all_branches: list[tuple[str, dict[str, Any] | None]] = [
+                (branch_name, positive_kwargs if branch_name == "positive" else negative_kwargs)
             ]
         else:
             # Sequential CFG (or no CFG): this PP pipeline handles all branches.
-            all_kwargs = [positive_kwargs]
+            all_branches = [("positive", positive_kwargs)]
             if do_true_cfg:
-                all_kwargs.append(negative_kwargs)
+                all_branches.append(("negative", negative_kwargs))
 
         # Non-first ranks receive intermediate tensors asynchronously
-        n = len(all_kwargs)
+        n = len(all_branches)
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
             for i in range(n):
@@ -275,8 +276,9 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
-            for kwargs, it in zip(all_kwargs, its):
-                result = self.predict_noise(**kwargs, intermediate_tensors=it)
+            for (branch, kwargs), it in zip(all_branches, its):
+                predict_kwargs = None if kwargs is None else {**kwargs, "intermediate_tensors": it}
+                result = self._predict_noise_for_cfg_branch(branch, predict_kwargs)
                 if step_pp_async:
                     self._prune_pp_send_work()
                     send_work = pp_group.isend_tensor_dict_nonblocking_metadata(result.tensors)
@@ -286,7 +288,13 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             return None
 
         # Last rank: run full forward
-        noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
+        noise_preds = [
+            self._predict_noise_for_cfg_branch(
+                branch,
+                None if kwargs is None else {**kwargs, "intermediate_tensors": it},
+            )
+            for (branch, kwargs), it in zip(all_branches, its)
+        ]
 
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine
@@ -307,10 +315,10 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 pos = _slice_pred(pos, output_slice)
                 neg = _slice_pred(neg, output_slice)
             return self.combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
-        pred = _wrap(noise_preds[0])
+        pred = noise_preds[0]
         if output_slice is not None:
-            pred = _slice_pred(pred, output_slice)
-        return _unwrap(pred)
+            pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
+        return pred
 
     def scheduler_step_maybe_with_cfg(
         self,
