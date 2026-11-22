@@ -86,7 +86,6 @@ class _KVOutputAggregator:
             native_outputs.append(
                 ModelRunnerOutput(
                     req_ids=[],
-                    req_id_to_index={},
                     sampled_token_ids=[],
                     logprobs=None,
                     prompt_logprobs_dict={},

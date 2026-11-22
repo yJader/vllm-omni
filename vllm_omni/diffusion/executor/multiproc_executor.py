@@ -764,7 +764,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()
-        if scheduler_output.has_nonblocking_kv_work:
+        if getattr(scheduler_output, "has_nonblocking_kv_work", False):
             return self.submit_step(scheduler_output).step_done.result(timeout=_DLO_DP_WAVE_TIMEOUT_S)
         try:
             result = self.collective_rpc(
