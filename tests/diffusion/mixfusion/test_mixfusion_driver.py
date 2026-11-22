@@ -158,3 +158,40 @@ def test_contract_failure_reduction_uses_cpu_group(monkeypatch):
     monkeypatch.setattr(driver_module.dist, "all_reduce", reduce)
     assert driver_module._any_rank_failed(False)
     assert calls == [("cpu", driver_module.dist.ReduceOp.MAX, group)]
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_contract_failure_reduction_avoids_cross_pp_stage_sync(monkeypatch, tp_size):
+    import vllm.distributed.parallel_state as vllm_ps
+
+    import vllm_omni.diffusion.distributed.parallel_state as parallel_state
+    import vllm_omni.diffusion.mixfusion.driver as driver_module
+
+    @dataclass
+    class Group:
+        world_size: int
+        cpu_group: object = None
+
+    tp_cpu_group = object()
+    monkeypatch.setattr(driver_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "_PP", Group(world_size=2))
+    monkeypatch.setattr(vllm_ps, "get_tp_group", lambda: Group(world_size=tp_size, cpu_group=tp_cpu_group))
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: pytest.fail("PP must not all-reduce across world.cpu_group"),
+    )
+    calls = []
+
+    def reduce(failed, *, op, group):
+        calls.append((failed.device.type, op, group))
+        failed.fill_(1)
+
+    monkeypatch.setattr(driver_module.dist, "all_reduce", reduce)
+    result = driver_module._any_rank_failed(False)
+    if tp_size == 1:
+        assert result is False
+        assert calls == []
+    else:
+        assert result is True
+        assert calls == [("cpu", driver_module.dist.ReduceOp.MAX, tp_cpu_group)]

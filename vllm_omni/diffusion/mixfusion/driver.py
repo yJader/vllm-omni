@@ -89,12 +89,29 @@ class MixFusionDriver:
 
 
 def _any_rank_failed(local_failed: bool) -> bool:
-    """Stop all executor ranks before model collectives on contract failure."""
+    """Stop peers within the collective stage before model collectives on contract failure."""
     if not dist.is_initialized():
         return local_failed
-    from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+    from vllm_omni.diffusion.distributed import parallel_state
 
-    world = get_world_group()
+    if parallel_state._PP is not None and parallel_state.get_pipeline_parallel_world_size() > 1:
+        # Cross-PP-stage all-reduce would serialize pipelined stages on every
+        # MixFusion step. Only synchronize intra-stage TP peers (SP and CFG
+        # parallel already disable MixFusion); stage-local errors propagate via
+        # the PP role-reply failure path.
+        from vllm.distributed.parallel_state import get_tp_group
+
+        try:
+            tp_group = get_tp_group()
+        except AssertionError:
+            return local_failed
+        if tp_group.world_size <= 1:
+            return local_failed
+        failed = torch.tensor(int(local_failed), dtype=torch.int32)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
+        return bool(failed.item())
+
+    world = parallel_state.get_world_group()
     if world.world_size == 1:
         return local_failed
     # This is host control state, so use the existing Gloo group rather than
