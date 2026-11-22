@@ -203,9 +203,12 @@ class BaseScheduler(ABC):
             request_id in self._request_states
             or request_id in self._kv_draining_requests
             or request_id in self._legacy_kv_requests
-            or any(
-                kv_request.request_id in self._kv_finished_request_ids
-                for kv_request in (request.diffusion_kv_requests or ())
+            or (
+                bool(self._kv_finished_request_ids)
+                and any(
+                    getattr(kv_request, "request_id", None) in self._kv_finished_request_ids
+                    for kv_request in (request.diffusion_kv_requests or ())
+                )
             )
         ):
             raise ValueError(f"request_id {request_id!r} is already active.")

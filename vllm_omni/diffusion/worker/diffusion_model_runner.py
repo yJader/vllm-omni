@@ -834,6 +834,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         return peak_memory_mb
 
+    def _consume_received_kv(self, req: OmniDiffusionRequest) -> bool:
+        consume = getattr(self.kv_transfer_manager, "consume_received_kv", None)
+        return bool(callable(consume) and consume(req))
+
     def _prepare_request_for_forward(
         self,
         req: OmniDiffusionRequest,
@@ -849,7 +853,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if self.kv_transfer_manager is None:
             self._initialize_generator(req.sampling_params)
             return
-        if self.kv_transfer_manager.consume_received_kv(req):
+        if self._consume_received_kv(req):
             self._initialize_generator(req.sampling_params)
             return
         # Receive AR KV. Single-request execution can use the prefetch path:
@@ -1385,7 +1389,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 cfg_kv_collect_func = getattr(self.od_config, "cfg_kv_collect_func", None)
                 if (
                     self.kv_transfer_manager is not None
-                    and not self.kv_transfer_manager.consume_received_kv(state_req)
+                    and not self._consume_received_kv(state_req)
                     and (
                         self.kv_transfer_manager.config.need_recv_cache
                         or (cfg_kv_collect_func is not None and getattr(new_state.sampling, "cfg_kv_request_ids", None))
