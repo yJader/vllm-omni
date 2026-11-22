@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import fields
 
 from vllm.config import VllmConfig
@@ -212,10 +212,15 @@ class BaseScheduler(ABC):
             if len(scheduled_cached_request_ids) >= self.max_num_running_reqs:
                 break
             state = self._request_states.get(request_id)
-            if state is not None and self._can_schedule_running(state):
+            if (
+                state is not None
+                and self._can_schedule_running(state)
+                and self._can_add_to_batch(state, scheduled_cached_request_ids)
+            ):
                 scheduled_cached_request_ids.append(request_id)
 
         # Second, schedule WAITING requests while capacity remains.
+        selected_ids = scheduled_cached_request_ids.copy()
         deferred: list[str] = []
         waiting_budget = len(self._waiting)
         resident_capacity = self.max_num_resident_reqs or self.max_num_running_reqs
@@ -223,7 +228,7 @@ class BaseScheduler(ABC):
             self._waiting
             and waiting_budget
             and len(self._running) < resident_capacity
-            and len(scheduled_cached_request_ids) + len(scheduled_new_reqs) < self.max_num_running_reqs
+            and len(selected_ids) < self.max_num_running_reqs
         ):
             waiting_budget -= 1
             request_id = self._waiting[0]
@@ -231,7 +236,7 @@ class BaseScheduler(ABC):
             if state is None:
                 self._waiting.popleft()
                 continue
-            if not self._can_schedule_waiting(state):
+            if not self._can_add_to_batch(state, selected_ids):
                 break
 
             diffusion_kv_metadata: DiffusionKVMetadata | None = None
@@ -267,7 +272,7 @@ class BaseScheduler(ABC):
                         break
                     # Check the lookup result before registering destination
                     # pages with the connector: deferred pages can be freed.
-                    if not self._can_schedule_waiting(state):
+                    if not self._can_add_to_batch(state, selected_ids):
                         self._diffusion_kv_manager.free_request(request_id)
                         break
                     diffusion_kv_metadata = allocation
@@ -301,6 +306,7 @@ class BaseScheduler(ABC):
                 self._running_sampling_params_key = state.sampling_params_key
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(request_id)
+            selected_ids.append(request_id)
             if was_new_request:
                 state.req.scheduler_queue_wait_ms = max((time.perf_counter() - state.queued_at) * 1000.0, 0.0)
                 scheduled_new_reqs.append(
@@ -776,6 +782,9 @@ class BaseScheduler(ABC):
                 "paged_scheduler Diffusion KV does not accept legacy dense KV payloads; "
                 f"clear these fields before admission: {fields_text}"
             )
+
+    def _can_add_to_batch(self, state: SchedulerRequestState, selected_ids: Sequence[str]) -> bool:
+        return state.status == DiffusionRequestStatus.RUNNING or self._can_schedule_waiting(state)
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not self._running:
