@@ -366,7 +366,7 @@ logical PP stage and stage-leader rank; each role has its own RPC ID.
 | Reply role | Future | Completion boundary |
 | --- | --- | --- |
 | First-stage leader (`entry`) | `pp0_done` | Local execution returned; the Engine may submit another batch if capacity permits |
-| Last-stage leader (`result`) | `step_done` | The complete step output is ready, including decode and output packing for finished requests |
+| Last-stage leader (`result`) | `step_done` | Last-stage device execution completed and the step output is ready (including decode and output packing for finished requests) |
 
 The Engine retires results in submission order and returns batch capacity only after retirement. `pp0_done` allows
 submission but does not release capacity or clear a request's in-flight state. The result pump completes both Futures

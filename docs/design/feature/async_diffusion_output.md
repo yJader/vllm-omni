@@ -108,7 +108,7 @@ the previous video; the engine must not force that storage to be released.
    - Waits for `gpu_event` (cross-stream sync ensuring forward wrote the tensor)
    - Runs `pack_diffusion_output_shm()` on a side CUDA stream
    - Enqueues `OUTPUT_READY` to `result_mq` when packing completes in request-mode
-   - Publishes `RpcReply` for [step-mode PP](#step-mode-pp-output)
+   - Publishes `RpcReply` for [step-mode PP](#step-mode-pp-output) terminal outputs and deferred non-terminal step completions
 
 3. **ResultPumpThread** (`multiproc_executor.py`): Sole reader of `result_mq` when enabled. Dispatches messages:
    - `COMPUTE_DONE` / `RPC_RESULT` → resolves `_rpc_futures[rpc_id]`
@@ -131,9 +131,11 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 ### Step-mode PP Output
 
 For batches eligible under [Configuration](#configuration), the last-stage leader records a device event and queues
-its original `RpcReply`. The background thread waits for the event, packs the output, and publishes the reply;
-packing failures return an error for the same RPC ID. The result pump resolves `step_done` only after packing completes,
-while the worker can execute an already submitted batch.
+its original `RpcReply`. For terminal batches, the background thread waits for the event, packs the output on the side
+stream, and publishes the reply. For non-terminal batches with no output tensors to pack, the last-stage leader records
+a non-blocking device event and queues the `RpcReply` so the background thread waits for `event.synchronize()` before
+publishing the reply without packing SHM. Failures return an error for the same RPC ID. The result pump resolves
+`step_done` only after the last-stage reply is published, while workers can execute already submitted batches.
 
 `post_decode()`, stage-payload transfer, and PP send/receive drains stay on the execution thread. Before handing off
 the output, the runner retires terminal states and invalidates their cached input batch. The background task retains

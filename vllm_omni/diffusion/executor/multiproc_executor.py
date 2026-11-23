@@ -218,7 +218,15 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
     def _init_result_queue(self, result_handle: Handle | None) -> MessageQueue:
         if result_handle is None:
             raise RuntimeError("Failed to get result queue handle from workers")
-        return MessageQueue.create_from_handle(result_handle, 0)
+        result_mq = MessageQueue.create_from_handle(result_handle, 0)
+        if (
+            self.od_config.step_execution
+            and getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) > 1
+            and result_mq._spin_condition is not None
+        ):
+            # Let the scheduler run after an entry ACK by parking idle result pumps.
+            result_mq._spin_condition.busy_loop_s = 0.0
+        return result_mq
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -779,7 +787,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
 
         Returns independent futures:
         * ``pp0_done``: PP0 (first stage) finishes local compute, can accept next batch.
-        * ``step_done``: Last stage produces final ``BaseRunnerOutput`` with updated latents.
+        * ``step_done``: Last stage finishes device execution and produces ``BaseRunnerOutput``.
 
         When PP=1, both complete together (fallback to synchronous execute_step).
         """
@@ -823,25 +831,35 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         def _chain_completion(f: concurrent.futures.Future) -> None:  # type: ignore[type-arg]
             entry_fut = futs[ids["entry"]]
             if not entry_fut.done():
-                exc = f.exception()
+                exc = concurrent.futures.CancelledError() if f.cancelled() else f.exception()
                 if exc is not None:
                     try_set_exception(entry_fut, exc)
                 else:
                     try_set_result(entry_fut, None)
 
-        futs[ids["result"]].add_done_callback(_chain_completion)
+        step_done = futs[ids["result"]]
+        step_done.add_done_callback(_chain_completion)
         if getattr(scheduler_output, "has_nonblocking_kv_work", False):
             # Missing cleanup/rank ACKs must not pin pages forever. The Engine
             # handles this exception through its existing fail-closed shutdown.
             timer = threading.Timer(
                 _DLO_DP_WAVE_TIMEOUT_S,
-                lambda: try_set_exception(futs[ids["result"]], TimeoutError("Missing diffusion KV step ACK")),
+                lambda: try_set_exception(step_done, TimeoutError("Missing diffusion KV step ACK")),
             )
             timer.daemon = True
             timer.start()
-            futs[ids["result"]].add_done_callback(lambda _: timer.cancel())
 
-        return PipelineStepFutures(pp0_done=futs[ids["entry"]], step_done=futs[ids["result"]])
+            def _cleanup_kv_step(completed: concurrent.futures.Future) -> None:  # type: ignore[type-arg]
+                timer.cancel()
+                if completed.cancelled() or completed.exception() is not None:
+                    with self._futures_lock:
+                        for rpc_id in ids.values():
+                            self._rpc_futures.pop(rpc_id, None)
+                        self._kv_step_reports.pop(ids["result"], None)
+
+            step_done.add_done_callback(_cleanup_kv_step)
+
+        return PipelineStepFutures(pp0_done=futs[ids["entry"]], step_done=step_done)
 
     def collective_rpc(
         self,
@@ -1315,12 +1333,10 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             self._result_mqs = []
             self._result_pump_threads = []
             with self._futures_lock:
-                for fut in self._rpc_futures.values():
-                    if not fut.done():
-                        try_set_exception(fut, RuntimeError("Executor shut down"))
-                for fut in self._output_futures.values():
-                    if not fut.done():
-                        try_set_exception(fut, RuntimeError("Executor shut down"))
+                pending_futures: list[concurrent.futures.Future[Any]] = [
+                    *self._rpc_futures.values(),
+                    *self._output_futures.values(),
+                ]
                 self._rpc_futures.clear()
                 if hasattr(self, "_kv_step_reports"):
                     self._kv_step_reports.clear()
@@ -1330,6 +1346,9 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                 # do not survive shutdown (issue #6413).
                 self._completed_outputs.clear()
                 self._dropped_output_ids.clear()
+            for fut in pending_futures:
+                if not fut.done():
+                    try_set_exception(fut, RuntimeError("Executor shut down"))
             self._processes = (cleaner.processes or []) if cleaner is not None else []
             if not self._processes:
                 if hasattr(self, "_kv_aggregator"):

@@ -221,8 +221,9 @@ class PipelineStepFutures:
     For asynchronous Step-PP execution:
     * ``pp0_done`` completes when PP0 (first stage) finishes its local
       computation and can accept another batch.
-    * ``step_done`` completes when the last stage produces the final
-      ``BaseRunnerOutput``, including updated latents.
+    * ``step_done`` completes once the last stage finishes device execution
+      and produces the ``BaseRunnerOutput`` (including decode and output
+      packing for finished requests).
 
     When PP=1 or step_execution=False, both futures complete together.
     """

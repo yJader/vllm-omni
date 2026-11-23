@@ -1787,6 +1787,13 @@ class CustomPipelineWorkerExtension:
         worker.init_lora_manager()
 
 
+@dataclass
+class _PendingStepEvent:
+    """Device event that gates a non-terminal Step-PP result reply without SHM packing."""
+
+    event: Any
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
@@ -1919,12 +1926,14 @@ class WorkerProc:
         self._enqueue_result(output)
 
     def _async_output_loop(self):
-        """Background thread: D2H + SHM packing for async diffusion output.
+        """Background thread: D2H + SHM packing and Step-PP event synchronization.
 
-        Uses a side stream so the D2H transfer does not block the default
-        stream where the next forward runs.
+        Uses a side stream so D2H transfers do not block the default stream
+        where the next forward runs.
         """
         device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
+        if device.type != "cpu":
+            torch.accelerator.set_device_index(self.gpu_id)
         d2h_stream = torch.Stream(device=device)
         transport_options = {}
         if self.od_config.video_output_transport.enable_registered_shm is True:
@@ -1936,11 +1945,17 @@ class WorkerProc:
             if item is None:
                 break
             job = _coerce_async_output_job(item)
+            dependency = job.gpu_event
             try:
+                if isinstance(dependency, _PendingStepEvent):
+                    if dependency.event is not None:
+                        dependency.event.synchronize()
+                    self._enqueue_result(job.output)
+                    continue
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
-                if job.gpu_event is not None:
-                    d2h_stream.wait_event(job.gpu_event)
+                if dependency is not None:
+                    d2h_stream.wait_event(dependency)
                 payload = job.output.result if isinstance(job.output, RpcReply) else job.output
                 pack_diffusion_output_shm(payload, d2h_stream=d2h_stream, **transport_options)
                 d2h_stream.synchronize()
@@ -1958,13 +1973,12 @@ class WorkerProc:
                     self._enqueue_result(job.output)
                 else:
                     self._enqueue_result(self._async_output_message(job))
-            except Exception:
-                logger.exception(
-                    "Async output packing failed for id '%s'; sending error",
-                    job.async_output_id,
-                )
+            except Exception as exc:
+                logger.exception("Async output or step completion failed for id '%s'", job.async_output_id)
                 if isinstance(job.output, RpcReply):
-                    self._enqueue_result(RpcReply(rpc_id=job.output.rpc_id, error="Background D2H/SHM packing failed"))
+                    self._enqueue_result(
+                        RpcReply(rpc_id=job.output.rpc_id, error=f"Background step reply failed: {exc}")
+                    )
                 else:
                     self._enqueue_result(
                         self._async_output_message(
@@ -1976,7 +1990,7 @@ class WorkerProc:
             finally:
                 with self._async_output_done:
                     # Clamped: only items enqueued by _return_result, emit_chunk,
-                    # and terminal PP role replies are counted.
+                    # and deferred PP role replies are counted.
                     self._async_output_pending = max(0, self._async_output_pending - 1)
                     if job.kind == AsyncOutputKind.CHUNK_READY:
                         self._chunk_output_pending = max(0, getattr(self, "_chunk_output_pending", 0) - 1)
@@ -2171,6 +2185,24 @@ class WorkerProc:
             and get_data_parallel_rank() == 0
         )
 
+    @staticmethod
+    def _record_nonblocking_step_event() -> Any | None:
+        """Record a non-blocking device event on the current stream.
+
+        Unlike ``current_omni_platform.record_device_event()``, this never
+        synchronizes the current stream on the worker thread (for example,
+        NPU's D2H helper synchronizes before recording for HCCL writes).
+        """
+        if not torch.accelerator.is_available():
+            return None
+        try:
+            event = torch.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record non-blocking PP step event; replying immediately")
+            return None
+
     def _execute_role_rpc(self, rpc_request: dict) -> None:
         """Execute a role-based RPC and send independent replies per role.
 
@@ -2247,13 +2279,14 @@ class WorkerProc:
                     result=result,
                     kv_rank=self.gpu_id if async_kv else None,
                 )
-                if (
-                    self._async_output_queue is not None
-                    and not self.od_config.streaming_output
-                    and isinstance(result, BatchRunnerOutput)
-                    and result.runner_outputs
-                    and all(item.finished for item in result.runner_outputs)
-                ):
+                batch_outputs = result.runner_outputs if isinstance(result, BatchRunnerOutput) else ()
+                is_all_terminal = bool(batch_outputs) and all(item.finished for item in batch_outputs)
+                is_non_terminal_step = (
+                    is_last_stage_leader
+                    and bool(batch_outputs)
+                    and all(not item.finished and item.result is None for item in batch_outputs)
+                )
+                if self._async_output_queue is not None and not self.od_config.streaming_output and is_all_terminal:
                     # Terminal states have been retired by the runner, so their
                     # output tensors cannot be reused by the next input batch.
                     # Streaming/mixed batches keep synchronous transport because
@@ -2262,6 +2295,19 @@ class WorkerProc:
                     with self._async_output_done:
                         self._async_output_pending += 1
                     self._async_output_queue.put((reply, reply.rpc_id, gpu_event))
+                elif self._async_output_queue is not None and is_non_terminal_step:
+                    # Non-terminal steps carry no output tensors to pack, but
+                    # their GPU forward and latent send are asynchronous. Wait
+                    # on a non-blocking device event in the background thread so
+                    # the Engine does not schedule the request's next step
+                    # before this stage completes device execution.
+                    step_event = self._record_nonblocking_step_event()
+                    if step_event is not None:
+                        with self._async_output_done:
+                            self._async_output_pending += 1
+                        self._async_output_queue.put((reply, reply.rpc_id, _PendingStepEvent(step_event)))
+                    else:
+                        self._enqueue_result(reply)
                 else:
                     if isinstance(result, BaseRunnerOutput):
                         pack_diffusion_output_shm(result)
