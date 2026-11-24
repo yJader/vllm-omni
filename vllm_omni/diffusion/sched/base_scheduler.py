@@ -219,6 +219,7 @@ class BaseScheduler(ABC):
             and self._kv_connector is None
             and omni_kv.get("need_recv_cache", False)
             and not request.is_dummy_run_request_id(request_id)
+            and per_sample_kv_count(request.sampling_params) == 1
         ):
             state.status = DiffusionRequestStatus.WAITING_FOR_KV
             self._legacy_kv_loading.add(request_id)

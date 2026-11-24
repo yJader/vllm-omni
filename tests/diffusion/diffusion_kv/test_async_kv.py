@@ -32,6 +32,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     _LegacyKVPayload,
     _TransferTopoConfig,
 )
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -89,6 +90,27 @@ def test_slow_and_ready_requests_are_isolated(cls):
     third = scheduler.schedule()
     assert third.scheduled_request_ids == ["ready"]
     assert scheduler.get_request_state("slow").status == DiffusionRequestStatus.WAITING_FOR_KV
+
+
+@pytest.mark.parametrize("cls", [RequestScheduler, StepScheduler])
+def test_per_sample_kv_request_bypasses_legacy_async_kv(cls):
+    scheduler = _legacy_scheduler(cls)
+    request = OmniDiffusionRequest(
+        request_id="multi",
+        prompt="multi",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=2,
+            extra_args={PER_SAMPLE_KV_COUNT_KEY: 2},
+        ),
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_request_ids == ["multi"]
+    assert output.kv_prefetch_job is None
+    assert not output.kv_poll_only
+    assert not output.has_nonblocking_kv_work
 
 
 @pytest.mark.parametrize("required", [None, set(), {"A"}])
