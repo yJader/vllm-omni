@@ -15,14 +15,14 @@ The async diffusion output feature moves the D2H (Device→Host) copy and SHM pa
 
 **Core benefit**: the previous request's output D2H/packing overlaps with the next request's forward pass.
 
-**Automatically enabled** when `step_execution=False` (default, request-mode). No extra configuration needed. When `step_execution=True` (step-mode), the original synchronous path is used — pump thread and Worker background thread are not started.
+Enabled automatically for request mode and eligible step-mode PP batches; see [Configuration](#configuration).
 
 ## Performance
 
 ### HunyuanImage-3.0 (TP4)
 
 | Resolution | Async Off (QPS) | Async On (QPS) | Change |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1024×1024 | 0.4773 | 0.4802 | +0.60% |
 | 768×768 | 0.8370 | 0.8533 | +1.95% |
 
@@ -32,7 +32,7 @@ The async diffusion output feature moves the D2H (Device→Host) copy and SHM pa
 
 ### Execution Timeline
 
-```
+```text
 Before (synchronous D2H):
 [forward req1] [D2H+SHM pack req1] [forward req2] [D2H+SHM pack req2]
                                  ^^^^^^^^^^^^^^^^ GPU bubble
@@ -45,7 +45,7 @@ After (async D2H):
 
 ### Data Flow
 
-```
+```text
                     ┌─────────────────────────────────────────────────────┐
                     │                 Worker Process                      │
                     │                                                    │
@@ -107,16 +107,18 @@ the previous video; the engine must not force that storage to be released.
 2. **Worker AsyncOutputThread** (`diffusion_worker.py`): Background daemon thread that:
    - Waits for `gpu_event` (cross-stream sync ensuring forward wrote the tensor)
    - Runs `pack_diffusion_output_shm()` on a side CUDA stream
-   - Enqueues `OUTPUT_READY` to `result_mq` when packing completes
+   - Enqueues `OUTPUT_READY` to `result_mq` when packing completes in request-mode
+   - Publishes `RpcReply` for [step-mode PP](#step-mode-pp-output)
 
-3. **ResultPumpThread** (`multiproc_executor.py`): Sole reader of `result_mq` in request-mode. Dispatches messages:
+3. **ResultPumpThread** (`multiproc_executor.py`): Sole reader of `result_mq` when enabled. Dispatches messages:
    - `COMPUTE_DONE` / `RPC_RESULT` → resolves `_rpc_futures[rpc_id]`
    - `OUTPUT_READY` → resolves `_output_futures[async_output_id]` (with batch split via `_batch_split_map`)
-   - Non-async messages → `_sync_result_buffer` for other RPCs
+   - `RpcReply` → resolves the corresponding step-PP role Future
+   - Other messages → `_sync_result_buffer` for other RPCs
 
 4. **collective_rpc() two-path dispatch** (`multiproc_executor.py`):
    - **Path 1**: `execute_model` / `execute_model_batch` → generates `rpc_id`, registers Future, waits for pump to deliver `compute_done`
-   - **Path 2**: All other RPCs → `_sync_result_buffer` (pump-fed) or `_result_mq` (step-mode, no pump)
+   - **Path 2**: All other RPCs → `_sync_result_buffer` when the pump is enabled, otherwise `_result_mq`
 
 5. **record_device_event** (`platforms/`): Cross-platform GPU event recording for side-stream synchronization. Implemented for CUDA, NPU, ROCm, XPU, MUSA; base class returns `None` (safe no-op).
 
@@ -125,6 +127,18 @@ the previous video; the engine must not force that storage to be released.
 ### Batch Split
 
 When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_id` for the entire batch, the executor splits it into per-request `async_output_id`s (format `{batch_id}/{request_id}`) via `_batch_split_map`. When `OUTPUT_READY` arrives, the pump extracts per-request results from the batch output and resolves each request's output future independently. If `OUTPUT_READY` arrives before `execute_batch` registers the split map, `execute_batch` directly adopts the early output.
+
+### Step-mode PP Output
+
+For batches eligible under [Configuration](#configuration), the last-stage leader records a device event and queues
+its original `RpcReply`. The background thread waits for the event, packs the output, and publishes the reply;
+packing failures return an error for the same RPC ID. The result pump resolves `step_done` only after packing completes,
+while the worker can execute an already submitted batch.
+
+`post_decode()`, stage-payload transfer, and PP send/receive drains stay on the execution thread. Before handing off
+the output, the runner retires terminal states and invalidates their cached input batch. The background task retains
+tensor storage until packing completes. Streaming and mixed finished/unfinished batches keep synchronous transport
+because live request states may still own mutable output storage.
 
 ### Reliability, Lifecycle & Timeout Behavior
 
@@ -139,7 +153,7 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
    - `ResultPumpThread` unpacks shared-memory payloads first, and then atomically resolves waiting futures or populates `_completed_outputs` under `_futures_lock`, avoiding race conditions with concurrent `wait_output_ready()` invocations.
 
 4. **Storage-Aware IPC Packing**:
-   `pack_diffusion_output_shm()` evaluates `max(view_bytes, storage_bytes)` against `_SHM_TENSOR_THRESHOLD` (1 MB) to ensure that per-request slices sharing a large batch storage are moved to POSIX shared memory rather than serialized through pickle over the MessageQueue inline buffer.
+   `pack_diffusion_output_shm()` evaluates `max(view_bytes, storage_bytes)` against `_SHM_TENSOR_THRESHOLD` (1 MB) to ensure that per-request slices sharing a large batch storage are moved to POSIX shared memory rather than serialized through pickle over the MessageQueue inline buffer. When a D2H side stream is supplied, device tensors below that threshold also use SHM so MessageQueue serialization cannot trigger a copy on the default stream. Small CPU tensors keep their inline transport.
 
 ## Model Coverage
 
@@ -150,16 +164,21 @@ All models running in request-mode (`step_execution=False`, the default) automat
 **Verified models**:
 
 | Model | Type | `supports_request_batch` |
-|---|---|---|
+| --- | --- | --- |
 | **HunyuanImage-3.0** | Image | `False` |
 | **Qwen-Image** | Image | `True` |
 | **LTX-2.3** | Video / Audio | `False` |
 
 Other models with `step_execution=False` are also supported but not yet verified.
 
-### Not Yet Supported (step-mode, `step_execution=True`)
+### Step-mode PP
 
-When `step_execution=True`, models use `execute_stepwise` instead of
+This path has CPU coverage for RPC progress during packing, output equality, error delivery and draining;
+GPU overlap and throughput require workload-specific validation.
+
+### Other Step-mode (`step_execution=True`, `pipeline_parallel_size == 1`)
+
+When `step_execution=True` without pipeline parallelism, models use `execute_stepwise` instead of
 `execute_model`, which is not in the async Path 1 whitelist. Async output is not
 applicable there. With `streaming_output=True`, pipelines implementing the
 existing Stepwise contract automatically select Stepwise. Request-only pipelines
@@ -167,9 +186,9 @@ remain on Request and can emit in-order `CHUNK_READY` messages during the forwar
 
 **Verified**: Helios (`step_execution=True`, does not benefit from this feature).
 
-Other models with `step_execution=True` are also not applicable.
+Other non-PP models with `step_execution=True` are also not applicable.
 
-Adapting step-mode requires additional design because:
+Adapting non-PP step-mode requires additional design because:
 
 - Each step's `RunnerOutput` must be available synchronously for the scheduler to advance
 - Intermediate latent tensors may not need D2H (only the final step needs D2H + postprocess)
@@ -212,14 +231,16 @@ Client streaming (`streaming_output=True`):
   hard-fails rather than falling back to sync mid-request decode.
 - For non-streaming decode overlap only, set `extra_args.async_chunk_decode`.
 
-Request-mode async D2H/SHM packing (finals / side-stream transport, separate from
-client streaming) needs no extra flag: it is enabled when `step_execution=False`
-(default).
+Background D2H/SHM packing (finals / side-stream transport, separate from
+client streaming) requires no additional configuration: it is enabled
+automatically for request-mode (`step_execution=False`) and for non-streaming,
+all-terminal batches in Step PP (`pipeline_parallel_size > 1`).
 
-| `step_execution` | Mode | Async Output | Pump Thread | Worker BG Thread |
-|---|---|---|---|---|
-| `False` (default) | request-mode | ✅ enabled | ✅ started | ✅ started |
-| `True` | step-mode | ❌ disabled | ❌ not started | ❌ not started |
+| Execution mode | Background output packing | Result pump | Worker background thread |
+| --- | --- | --- | --- |
+| Request mode (`step_execution=False`) | All outputs | Started | Started |
+| Step PP (`pipeline_parallel_size > 1`) | Non-streaming, all-terminal batches | Started for PP role replies | Started |
+| Other step execution | Synchronous transport | Existing synchronous path | Not started |
 
 ## Related Files
 

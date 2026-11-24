@@ -37,6 +37,12 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVCacheConfig,
+    OmniKVTransferManager,
+    ReceiveRole,
+    _TransferTopoConfig,
+)
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -264,6 +270,7 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
         device=runner.device,
     )
     runner.kv_transfer_manager = SimpleNamespace(
+        config=OmniKVCacheConfig(),
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
         receive_multi_kv_cache_distributed=lambda *a, **k: None,
@@ -695,6 +702,117 @@ def test_update_states_after_list_latents_releases_finished_step_requests():
     assert runner.input_batch is None
     # Surviving requests keep their scattered latents.
     assert active_state.latents.shape == (1, 3)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("need_recv_cache, payload_available", [(False, False), (True, True), (True, False)])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("topology", ["local", "world", "tp", "tp_cfg", "tp_sp", "tp_cfg_sp"])
+def test_update_states_only_receives_configured_kv(need_recv_cache, payload_available, rank, topology):
+    """Disabled receive must never reach collectives, including on PP followers."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    manager = OmniKVTransferManager(OmniKVCacheConfig(need_recv_cache=need_recv_cache))
+    runner.kv_transfer_manager = manager
+    local = topology in ("local", "tp")
+    cfg_size = 2 if "cfg" in topology else 1
+    sp_size = 2 if "sp" in topology else 1
+    kv = SimpleNamespace(key_cache=[torch.ones(1, 2)], value_cache=[torch.zeros(1, 2)])
+    metadata = {"seq_len": 1}
+    payload = {"past_key_values": kv, "sp.past_key_values": kv, "kv_metadata": metadata, "sp.kv_metadata": metadata}
+    world = Mock(rank_in_group=rank)
+    cfg_group = Mock(rank_in_group=rank)
+    sp_group = Mock(rank_in_group=rank)
+    for group in (world, cfg_group, sp_group):
+        group.broadcast_object.return_value = payload if payload_available else None
+        group.recv_object.return_value = payload if payload_available else None
+    manager._topo_config = _TransferTopoConfig(
+        role=ReceiveRole.LOCAL if local else (ReceiveRole.LEADER if rank == 0 else ReceiveRole.FOLLOWER),
+        tp_active=topology.startswith("tp"),
+        cfg_size=cfg_size,
+        cfg_rank=rank if cfg_size > 1 else 0,
+        cfg_group=cfg_group,
+        sp_size=sp_size,
+        sp_rank=rank if sp_size > 1 and cfg_size == 1 else 0,
+        sp_group=sp_group,
+        world=world,
+    )
+    # Exercise object transport with CPU tensors, without starting a process group.
+    manager._pack_kv_payload = Mock(return_value=None)
+    manager.receive_kv_cache_for_request = Mock(
+        return_value=({"layer_blocks": vars(kv), "metadata": metadata}, 16) if payload_available else (None, 0)
+    )
+    receive = Mock(wraps=manager.receive_multi_kv_cache_distributed)
+    manager.receive_multi_kv_cache_distributed = receive
+    request = _make_request()
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    states, new_ids = runner._update_states(scheduler_output)
+
+    assert new_ids == [request.request_id]
+    assert runner.state_cache[request.request_id] is states[0]
+    assert not hasattr(request.sampling_params, "past_key_values") or request.sampling_params.past_key_values is None
+    if not need_recv_cache:
+        world.broadcast_object.assert_not_called()
+        receive.assert_not_called()
+        manager.receive_kv_cache_for_request.assert_not_called()
+        assert not any(group.mock_calls for group in (world, cfg_group, sp_group))
+        return
+
+    receive.assert_called_once()
+    if payload_available:
+        assert torch.equal(states[0].sampling.past_key_values.key_cache[0], kv.key_cache[0])
+        assert states[0].sampling.kv_metadata == metadata
+    else:
+        assert getattr(states[0].sampling, "past_key_values", None) is None
+    assert manager.receive_kv_cache_for_request.call_count == int(local or rank == 0)
+    assert world.broadcast_object.call_count == int(topology == "world")
+    assert cfg_group.send_object.call_count == int(cfg_size > 1 and rank == 0)
+    assert cfg_group.recv_object.call_count == int(cfg_size > 1 and rank == 1)
+    assert sp_group.broadcast_object.call_count == int(sp_size > 1)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_update_states_preserves_cfg_collection_without_primary_receive():
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    collector = Mock(return_value={"cfg_text_kv_metadata": {"seq_len": 3}})
+    runner.od_config.cfg_kv_collect_func = collector
+    manager = OmniKVTransferManager(OmniKVCacheConfig(need_recv_cache=False))
+    manager._topo_config = _TransferTopoConfig(
+        role=ReceiveRole.LOCAL,
+        tp_active=False,
+        cfg_size=1,
+        cfg_rank=0,
+        cfg_group=None,
+        sp_size=1,
+        sp_rank=0,
+        sp_group=None,
+        world=None,
+    )
+    runner.kv_transfer_manager = manager
+    request = _make_request()
+    request.sampling_params.cfg_kv_request_ids = {"cfg_text": "companion"}
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    states, _ = runner._update_states(scheduler_output)
+
+    collector.assert_called_once_with(request.request_id, {"cfg_text": "companion"}, manager, runner._target_device)
+    assert states[0].sampling.cfg_text_kv_metadata == {"seq_len": 3}
 
 
 @pytest.mark.core_model

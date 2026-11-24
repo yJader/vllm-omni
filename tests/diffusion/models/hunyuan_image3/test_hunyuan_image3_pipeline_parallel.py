@@ -208,12 +208,13 @@ def test_hunyuan_feedback_preserves_latent_dtype_before_fixed_shape_send(monkeyp
     pipeline = torch.nn.Module.__new__(HunyuanImage3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(step_execution=True)
-    state = SimpleNamespace(
+    state = StepRequestState(
+        request_id="request",
+        sampling=OmniDiffusionSamplingParams(),
         extra={pipeline_module._STEP_GENERATOR: torch.Generator().manual_seed(42)},
         latents=torch.zeros(1, 32, 2, 2, dtype=torch.bfloat16),
-        current_timestep=scheduler.timesteps[0],
+        timesteps=scheduler.timesteps,
         scheduler=scheduler,
-        step_index=0,
     )
 
     pipeline.step_scheduler(state, torch.ones_like(state.latents, dtype=torch.float32))
@@ -222,6 +223,7 @@ def test_hunyuan_feedback_preserves_latent_dtype_before_fixed_shape_send(monkeyp
     assert sent[0].dtype == torch.bfloat16
     assert state.latents.dtype == torch.bfloat16
     assert state.step_index == 1
+    assert not state.denoise_completed
 
 
 @pytest.mark.parametrize("last_stage", [False, True])
@@ -356,3 +358,64 @@ def test_scheduler_uses_request_state_and_preserves_dtype(monkeypatch, pp_size, 
         assert state.step_index == step + 1
         assert state.latents.dtype == torch.bfloat16
         torch.testing.assert_close(state.latents, latents, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("first_stage", [False, True], ids=["sender", "receiver"])
+@pytest.mark.parametrize("step_index", [0, 1], ids=["continuation", "terminal"])
+def test_hunyuan_posts_feedback_only_when_another_step_needs_it(monkeypatch, first_stage, step_index):
+    from vllm_omni.diffusion.distributed import pipeline_parallel as pp_module
+    from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
+
+    feedback = []
+
+    class Group:
+        is_first_rank = first_stage
+        is_last_rank = not first_stage
+        world_size = 2
+
+        def isend_tensor(self, tensor, dst):
+            assert dst == 0
+            feedback.append("send")
+            assert tensor.dtype == torch.bfloat16
+            return []
+
+        def irecv_tensor(self, tensor, src):
+            assert src == 1
+            feedback.append("receive")
+            assert tensor.dtype == torch.bfloat16
+            return []
+
+    class Scheduler:
+        def step(self, noise_pred, timestep, latents, return_dict):
+            return (latents + noise_pred,)
+
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(pp_module, "get_pp_group", Group)
+    pipeline = torch.nn.Module.__new__(HunyuanImage3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(step_execution=True)
+    latents = torch.zeros(1, 4, 2, 2, dtype=torch.bfloat16)
+    state = StepRequestState(
+        request_id="request",
+        sampling=OmniDiffusionSamplingParams(),
+        timesteps=torch.tensor([1.0, 0.5]),
+        step_index=step_index,
+        latents=latents,
+        scheduler=Scheduler(),
+    )
+    prediction = None if first_stage else torch.ones_like(latents, dtype=torch.float32)
+
+    pipeline.step_scheduler(state, prediction)
+
+    assert state.step_index == step_index + 1
+    if step_index == 0:
+        assert feedback == (["receive"] if first_stage else ["send"])
+        assert isinstance(state.latents, AsyncLatents) is first_stage
+    else:
+        assert feedback == [], "terminal latents are consumed only on the last PP stage"
+        assert isinstance(state.latents, torch.Tensor)
+        if first_stage:
+            assert state.latents is latents
+    if not first_stage:
+        assert state.latents.dtype == torch.bfloat16
+        torch.testing.assert_close(state.latents, torch.ones_like(latents), rtol=0, atol=0)

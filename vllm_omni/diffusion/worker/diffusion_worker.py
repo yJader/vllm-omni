@@ -48,6 +48,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     OmniSleepTask,
     OmniWakeTask,
+    RpcReply,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
@@ -1811,7 +1812,7 @@ class WorkerProc:
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
-        if not self.od_config.step_execution:
+        if not self.od_config.step_execution or self.od_config.parallel_config.pipeline_parallel_size > 1:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1914,31 +1915,42 @@ class WorkerProc:
                 # writing the output tensors before the side stream reads.
                 if job.gpu_event is not None:
                     d2h_stream.wait_event(job.gpu_event)
-                pack_diffusion_output_shm(job.output, d2h_stream=d2h_stream, **transport_options)
+                payload = job.output.result if isinstance(job.output, RpcReply) else job.output
+                pack_diffusion_output_shm(payload, d2h_stream=d2h_stream, **transport_options)
                 d2h_stream.synchronize()
                 if (
-                    job.output is not None
+                    not isinstance(job.output, RpcReply)
+                    and job.output is not None
                     and hasattr(job.output, "async_output_id")
                     and getattr(job.output, "async_output_id", None) is None
                 ):
                     job.output.async_output_id = job.async_output_id
 
-                self._enqueue_result(self._async_output_message(job))
+                if isinstance(job.output, RpcReply):
+                    # PP step_done still means the final payload is ready. Only
+                    # the worker RPC loop is released early, not the Future.
+                    self._enqueue_result(job.output)
+                else:
+                    self._enqueue_result(self._async_output_message(job))
             except Exception:
                 logger.exception(
                     "Async output packing failed for id '%s'; sending error",
                     job.async_output_id,
                 )
-                self._enqueue_result(
-                    self._async_output_message(
-                        job,
-                        output=None,
-                        error="Background D2H/SHM packing failed",
+                if isinstance(job.output, RpcReply):
+                    self._enqueue_result(RpcReply(rpc_id=job.output.rpc_id, error="Background D2H/SHM packing failed"))
+                else:
+                    self._enqueue_result(
+                        self._async_output_message(
+                            job,
+                            output=None,
+                            error="Background D2H/SHM packing failed",
+                        )
                     )
-                )
             finally:
                 with self._async_output_done:
-                    # Clamped: only items enqueued by _return_result / emit_chunk are counted.
+                    # Clamped: only items enqueued by _return_result, emit_chunk,
+                    # and terminal PP role replies are counted.
                     self._async_output_pending = max(0, self._async_output_pending - 1)
                     if job.kind == AsyncOutputKind.CHUNK_READY:
                         self._chunk_output_pending = max(0, getattr(self, "_chunk_output_pending", 0) - 1)
@@ -2140,12 +2152,10 @@ class WorkerProc:
         last stage leader replies "result" (full step done), middle stages execute
         but don't reply. Errors are fanned out to all reply_roles.
         """
-        from vllm_omni.diffusion.data import RpcReply
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_pipeline_parallel_rank,
             get_pipeline_parallel_world_size,
         )
-        from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         reply_roles = rpc_request.get("reply_roles", {})
@@ -2173,10 +2183,26 @@ class WorkerProc:
                 self._enqueue_result(RpcReply(rpc_id=reply_roles["entry"], result=None))
 
             if is_last_stage_leader and self.result_mq is not None:
-                # Full step done: pack SHM and send BaseRunnerOutput
-                if isinstance(result, BaseRunnerOutput):
-                    pack_diffusion_output_shm(result)
-                self._enqueue_result(RpcReply(rpc_id=reply_roles["result"], result=result))
+                reply = RpcReply(rpc_id=reply_roles["result"], result=result)
+                if (
+                    self._async_output_queue is not None
+                    and not self.od_config.streaming_output
+                    and isinstance(result, BatchRunnerOutput)
+                    and result.runner_outputs
+                    and all(item.finished for item in result.runner_outputs)
+                ):
+                    # Terminal states have been retired by the runner, so their
+                    # output tensors cannot be reused by the next input batch.
+                    # Streaming/mixed batches keep synchronous transport because
+                    # their live states may still own mutable output storage.
+                    gpu_event = current_omni_platform.record_device_event()
+                    with self._async_output_done:
+                        self._async_output_pending += 1
+                    self._async_output_queue.put((reply, reply.rpc_id, gpu_event))
+                else:
+                    if isinstance(result, BaseRunnerOutput):
+                        pack_diffusion_output_shm(result)
+                    self._enqueue_result(reply)
 
         except Exception as exc:
             error_str = str(exc) or type(exc).__name__
