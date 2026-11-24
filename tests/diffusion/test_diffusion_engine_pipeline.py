@@ -241,6 +241,39 @@ async def test_worker_control_rpc_drains_submitted_pipeline_batches():
 
 
 @pytest.mark.asyncio
+async def test_pause_scheduler_drains_pipeline_batches_and_returns_none():
+    engine = _make_engine(asyncio.get_running_loop())
+    output = _add_request(engine, "a")
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        _, pp0_done, step_done = engine.executor.batches[0]
+        pp0_done.set_result(None)
+        task = _RpcTask(
+            method="pause_scheduler",
+            args=(),
+            kwargs={"mode": "keep"},
+            deadline=None,
+            unique_reply_rank=None,
+        )
+        with engine._cv:
+            engine._scheduling_paused = True
+            engine._rpc_queue.put(task)
+            engine._cv.notify_all()
+
+        await asyncio.sleep(0.03)
+        assert not task.future.done()
+        assert engine.executor.rpc_calls == []
+
+        step_done.set_result(_step_output("a"))
+        await asyncio.sleep(0.03)
+        assert task.future.result(timeout=0) is None
+        assert engine.executor.rpc_calls == ["synchronize_device"]
+        assert output.get_nowait().finished
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
 async def test_engine_shutdown_drains_submitted_pipeline_batches():
     engine = _make_engine(asyncio.get_running_loop())
     _add_request(engine, "a")

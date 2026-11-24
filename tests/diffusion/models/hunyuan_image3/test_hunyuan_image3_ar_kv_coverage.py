@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Text2ImagePipeline
@@ -120,3 +122,35 @@ def test_dense_ar_reuse_rejects_coverage_that_cannot_rebuild_the_remaining_prefi
 
     assert kwargs["query_lens"] == [12]
     pipe.model.inject_ar_kv_into_layers.assert_not_called()
+
+
+def test_dense_ar_reuse_skips_pp_missing_layers():
+    pipe, input_ids, kwargs = _pipeline_and_inputs()
+    pipe.model.model = SimpleNamespace(
+        layers=[PPMissingLayer(), _Layer(layer_idx=1)],
+        start_layer=1,
+        end_layer=2,
+    )
+    cache = {1: {"key": torch.zeros(6, 1, 2), "value": torch.zeros(7, 1, 2)}}
+    kwargs["ar_kv_data"] = cache
+
+    output, reuse_len = pipe._maybe_handle_ar_kv_reuse(input_ids, kwargs, 1, False, None, torch.device("cpu"))
+
+    assert reuse_len == 6
+    torch.testing.assert_close(output, input_ids[:, 6:])
+    pipe.model.inject_ar_kv_into_layers.assert_called_once_with(cache, 6)
+
+
+def test_keep_negative_kv_only_skips_pp_missing_layers():
+    pipe, _, _ = _pipeline_and_inputs()
+    local_mgr = SimpleNamespace(_injected_ar_kv=["pos", "neg"])
+    local_layer = SimpleNamespace(self_attn=SimpleNamespace(image_attn=local_mgr))
+    pipe.model.model = SimpleNamespace(
+        layers=[PPMissingLayer(), local_layer],
+        start_layer=1,
+        end_layer=2,
+    )
+
+    pipe._keep_negative_kv_only()
+
+    assert local_mgr._injected_ar_kv == ["neg"]
