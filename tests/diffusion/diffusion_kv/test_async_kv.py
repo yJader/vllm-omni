@@ -694,3 +694,49 @@ def test_worker_retains_pool_if_connector_shutdown_fails(mocker):
         worker.shutdown()
     assert worker.model_runner is runner
     assert not worker._shutdown_complete
+
+
+def test_async_kv_failure_drain_holds_engine_lock():
+    import queue
+
+    engine = object.__new__(DiffusionEngine)
+    engine.stop_event = threading.Event()
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._kv_failures = {"bad": "timeout"}
+    engine._pipeline_async_enabled = False
+    engine._scheduling_paused = False
+    engine._streaming_playback = {}
+    engine.abort_queue = queue.Queue()
+    engine._rpc_queue = queue.Queue()
+
+    scheduler = _legacy_scheduler()
+    scheduler.add_request(_legacy_request("bad"))
+    orig_finish = scheduler.finish_kv_transfer
+    observed_locked: list[bool] = []
+
+    def spy_finish(output):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            acquired = pool.submit(engine._rpc_lock.acquire, False).result(timeout=1)
+            if acquired:
+                pool.submit(engine._rpc_lock.release).result(timeout=1)
+            observed_locked.append(not acquired)
+        return orig_finish(output)
+
+    scheduler.finish_kv_transfer = spy_finish
+    engine.scheduler = scheduler
+    emitted: list[set[str]] = []
+    engine._process_aborts_queue = lambda: None
+    engine._process_rpc_queue = lambda: None
+    engine._expire_streaming_idle = lambda: None
+    engine._fail_pending_rpcs = lambda _exc: None
+    engine._emit_finished_outputs = lambda ids, *_args, **_kwargs: (
+        emitted.append(set(ids)),
+        engine.stop_event.set(),
+    )
+
+    engine._busy_loop()
+
+    assert observed_locked == [True]
+    assert emitted == [{"bad"}]
+    assert scheduler.get_request_state("bad").status == DiffusionRequestStatus.FINISHED_ERROR

@@ -804,13 +804,15 @@ class DiffusionEngine:
             # Phase 2: Shared control flow
             with self._cv:
                 errors, self._kv_failures = getattr(self, "_kv_failures", {}), {}
-            if errors:
-                self.scheduler.finish_kv_transfer(BatchRunnerOutput([], kv_failed_req_ids=errors))
-                failed_ids = {
-                    rid
-                    for rid in errors
-                    if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
-                }
+                failed_ids: set[str] = set()
+                if errors:
+                    self.scheduler.finish_kv_transfer(BatchRunnerOutput([], kv_failed_req_ids=errors))
+                    failed_ids = {
+                        rid
+                        for rid in errors
+                        if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
+                    }
+            if failed_ids:
                 self._emit_finished_outputs(failed_ids)
             self._process_aborts_queue()
             self._process_rpc_queue()
