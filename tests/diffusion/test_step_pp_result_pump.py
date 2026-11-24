@@ -99,10 +99,15 @@ def test_step_pp_receives_both_roles_then_control_reply(monkeypatch, worker_erro
     assert all(not thread.is_alive() for thread in pump_threads)
 
 
-def test_step_pp_shutdown_fails_pending_futures(monkeypatch):
+def test_step_pp_kv_timeout_and_shutdown(monkeypatch):
     queues = [_Queue(), _Queue()]
+    roles_list: list[dict[str, str]] = []
 
-    broadcast = SimpleNamespace(export_handle=lambda: None, enqueue=lambda *args, **kwargs: None)
+    def enqueue(message, **kwargs):
+        if isinstance(message, dict) and "reply_roles" in message:
+            roles_list.append(dict(message["reply_roles"]))
+
+    broadcast = SimpleNamespace(export_handle=lambda: None, enqueue=enqueue)
     monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_broadcast_queue", lambda *_: broadcast)
     monkeypatch.setattr(MultiprocDiffusionExecutor, "_launch_workers", lambda *_: ([], [0, 1]))
     monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_result_queue", lambda _, index: queues[index])
@@ -115,7 +120,23 @@ def test_step_pp_shutdown_fails_pending_futures(monkeypatch):
     )
     executor._init_executor()
     try:
+        monkeypatch.setattr("vllm_omni.diffusion.executor.multiproc_executor._DLO_DP_WAVE_TIMEOUT_S", 0.15)
+        kv_step = SimpleNamespace(
+            scheduled_request_ids=["q0"],
+            has_nonblocking_kv_work=True,
+            kv_finished_request_ids=set(),
+        )
+        futures = executor.submit_step(kv_step)
+        roles = roles_list[-1]
+        assert set(roles) == {"entry", "result"}
+        queues[0].queue.put(RpcReply(roles["result"], BatchRunnerOutput.from_list([]), kv_rank=0))
+        with pytest.raises(TimeoutError, match="Missing diffusion KV step ACK"):
+            futures.step_done.result(timeout=2)
+        assert roles["result"] not in executor._kv_step_reports
+        assert roles["result"] not in executor._rpc_futures
+
         # Shutdown while step_done is pending must fail both futures cleanly without deadlock.
+        monkeypatch.setattr("vllm_omni.diffusion.executor.multiproc_executor._DLO_DP_WAVE_TIMEOUT_S", 10.0)
         pending = executor.submit_step(SimpleNamespace(scheduled_request_ids=["q1"]))
         executor.shutdown()
         with pytest.raises(RuntimeError, match="Executor shut down"):
