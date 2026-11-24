@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
 import json
 import struct
+import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
 from dataclasses import asdict, dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 from vllm.logger import init_logger
@@ -51,6 +52,20 @@ class KVPrefetchConsumeError(RuntimeError):
     """Payload consumed from connector but post-get processing failed — sync retry impossible."""
 
 
+class _ReadyEvent(Protocol):
+    def query(self) -> bool: ...
+    def synchronize(self) -> None: ...
+
+
+@dataclass
+class _LegacyKVPayload:
+    data: dict[str, Any]
+    ready: _ReadyEvent | None
+    # Keep the source storage alive until H2D has completed, independently
+    # of the device tensor's lifetime on the consumer stream.
+    sources: list[torch.Tensor]
+
+
 class ReceiveRole(enum.Enum):
     """How a rank obtains KV: LOCAL pulls its own shard, LEADER pulls then
     distributes, FOLLOWER receives via collective."""
@@ -79,6 +94,9 @@ class _TransferTopoConfig:
     # must use this group, never ``world``.
     tp_group: Any = None
     tp_size: int = 1
+    pp_group: Any = None
+    pp_rank: int = 0
+    pp_size: int = 1
 
     @property
     def is_leader(self) -> bool:
@@ -415,6 +433,10 @@ class OmniKVTransferManager:
         )
 
         self._prefetch_futures: dict[str, Any] = {}
+        self._receive_executor: ThreadPoolExecutor | None = None
+        self._receive_futures: dict[str, Future[_LegacyKVPayload]] = {}
+        self._receive_cancels: dict[str, threading.Event] = {}
+        self._ready_legacy_kv: dict[str, _LegacyKVPayload] = {}
         self._bg_copy_stream: current_omni_platform.Stream | None = None
 
         self._topo_config: _TransferTopoConfig | None = None
@@ -595,6 +617,7 @@ class OmniKVTransferManager:
             get_cfg_group,
             get_classifier_free_guidance_rank,
             get_classifier_free_guidance_world_size,
+            get_pp_group,
             get_sequence_parallel_rank,
             get_sequence_parallel_world_size,
             get_sp_group,
@@ -652,10 +675,16 @@ class OmniKVTransferManager:
         except Exception:
             sp_size, sp_rank, sp_group = 1, 0, None  # SP not enabled
 
-        if tp_active and cfg_size <= 1 and sp_size <= 1:
+        try:
+            pp_group = get_pp_group()
+            pp_size, pp_rank = pp_group.world_size, pp_group.rank_in_group
+        except AssertionError:
+            pp_size, pp_rank, pp_group = 1, 0, None
+
+        if tp_active and cfg_size <= 1 and sp_size <= 1 and pp_size <= 1:
             role = ReceiveRole.LOCAL
-        elif tp_active and (cfg_size > 1 or sp_size > 1):
-            role = ReceiveRole.LEADER if (cfg_rank == 0 and sp_rank == 0) else ReceiveRole.FOLLOWER
+        elif tp_active and (cfg_size > 1 or sp_size > 1 or pp_size > 1):
+            role = ReceiveRole.LEADER if (cfg_rank == 0 and sp_rank == 0 and pp_rank == 0) else ReceiveRole.FOLLOWER
         else:
             role = ReceiveRole.LEADER if world_rank == 0 else ReceiveRole.FOLLOWER
 
@@ -681,6 +710,9 @@ class OmniKVTransferManager:
             world=world,
             tp_group=tp_group,
             tp_size=tp_size,
+            pp_group=pp_group,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
         )
 
     def _resolve_sender_info(
@@ -1290,6 +1322,130 @@ class OmniKVTransferManager:
         except Exception:
             logger.exception("Failed to submit KV prefetch for %s", rid)
 
+    def start_receive_kv_async(self, job: KVPrefetchJob, target_device: torch.device) -> list[str]:
+        """Start a rank-local read; only the executor may unlink shared keys."""
+        rid = job["request_id"]
+        if not self.config.need_recv_cache or OmniDiffusionRequest.is_dummy_run_request_id(rid):
+            return []
+        if rid in self._receive_cancels:
+            raise RuntimeError(f"Duplicate legacy KV receive: {rid}")
+        keys = self._shared_receive_keys(rid)
+        if self._receive_executor is None:
+            # Separate requests must make progress even if one source is slow.
+            self._receive_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kv-receive")
+        cancel = threading.Event()
+        self._receive_cancels[rid] = cancel
+        self._receive_futures[rid] = self._receive_executor.submit(
+            self._receive_payload_async, job, target_device, cancel
+        )
+        return keys
+
+    def _shared_receive_keys(self, request_id: str) -> list[str]:
+        from .connectors.shm_connector import SharedMemoryConnector
+
+        if OmniDiffusionRequest.is_dummy_run_request_id(request_id):
+            return []
+        connector = self.connector  # initialize on the Worker thread
+        if not isinstance(connector, SharedMemoryConnector):
+            return []
+        connector.unlink_on_get = False
+        from_stage, to_stage = self.recv_stages
+        if from_stage is None or to_stage is None:
+            raise ValueError("Legacy KV receive stages are not configured")
+        return [
+            key
+            for key, _ in build_rank_aware_recv_keys(
+                request_id, from_stage, to_stage, self._tp_topo, hook=self.kv_recv_key_builder
+            )
+        ]
+
+    def _receive_payload_async(
+        self, job: KVPrefetchJob, target_device: torch.device, cancel: threading.Event
+    ) -> _LegacyKVPayload:
+        # Detach any connector-owned CPU pool views before returning them.
+        data, _ = self.receive_kv_cache_for_request(
+            job["request_id"], torch.device("cpu"), sender_info=job["kv_sender_info"], cancel_event=cancel
+        )
+        if data is None:
+            raise TimeoutError(f"Legacy KV receive failed or timed out for {job['request_id']}")
+        if target_device.type == "cpu":
+            return _LegacyKVPayload(data, None, [])
+        torch.accelerator.set_device_index(target_device.index)
+        stream = current_omni_platform.Stream()
+        sources: list[torch.Tensor] = []
+        try:
+            with current_omni_platform.stream(stream):
+                for cache in data.get("layer_blocks", {}).values():
+                    if not isinstance(cache, list):
+                        continue
+                    for index, tensor in enumerate(cache):
+                        if isinstance(tensor, torch.Tensor):
+                            sources.append(tensor)
+                            cache[index] = tensor.to(target_device, non_blocking=True).contiguous()
+                ready = current_omni_platform.record_device_event()
+            if ready is None:
+                stream.synchronize()
+        except Exception:
+            # Earlier copies may have launched before a later copy failed.
+            # Keep their source references until this stream finishes.
+            stream.synchronize()
+            raise
+        return _LegacyKVPayload(data, ready, sources)
+
+    def cancel_receive_kv(self, request_id: str) -> list[str]:
+        self._receive_cancels.setdefault(request_id, threading.Event()).set()
+        self._ready_legacy_kv.pop(request_id, None)
+        future = self._receive_futures.get(request_id)
+        if future is not None:
+            future.cancel()
+        return self._shared_receive_keys(request_id) if self.config.need_recv_cache else []
+
+    def poll_legacy_kv(self) -> tuple[list[str], dict[str, str], list[str]]:
+        finished: list[str] = []
+        failed: dict[str, str] = {}
+        cancelled: list[str] = []
+        for rid, cancel in list(self._receive_cancels.items()):
+            future = self._receive_futures.get(rid)
+            if future is not None:
+                if not future.done():
+                    continue
+                if not future.cancelled():
+                    try:
+                        payload = future.result()
+                    except Exception as exc:
+                        if not cancel.is_set():
+                            failed[rid] = str(exc)
+                    else:
+                        if payload.ready is not None and not payload.ready.query():
+                            continue
+                        payload.sources.clear()
+                        if not cancel.is_set():
+                            self._ready_legacy_kv[rid] = payload
+                            finished.append(rid)
+                del self._receive_futures[rid]
+            if cancel.is_set():
+                cancelled.append(rid)
+                del self._receive_cancels[rid]
+        return finished, failed, cancelled
+
+    def consume_received_kv(self, req: OmniDiffusionRequest) -> bool:
+        payload = self._ready_legacy_kv.pop(req.request_id, None)
+        if payload is None:
+            if req.request_id in self._receive_cancels:
+                raise RuntimeError(f"Legacy KV is not ready for {req.request_id}")
+            return False
+        # query() succeeded before the completion ACK. record_stream protects
+        # device allocations after the background stream's owner is dropped.
+        self._record_stream_for_prefetched(payload.data)
+        self.apply_kv_cache_to_request(req, payload.data)
+        topology = self.topo_config
+        if topology.tp_active and topology.cfg_active:
+            local_payload = self._build_cfg_rank_local_payloads(req, topology.cfg_size)[topology.cfg_rank]
+            self._clear_request_kv_payload(req)
+            if local_payload is not None:
+                self._apply_request_kv_payload(req, local_payload)
+        return True
+
     def _prefetch_payload(
         self,
         request_id: str,
@@ -1382,6 +1538,18 @@ class OmniKVTransferManager:
     def close(self) -> None:
         """Stop prefetch work before closing the connector owned by this manager."""
         try:
+            for cancel in self._receive_cancels.values():
+                cancel.set()
+            if self._receive_executor is not None:
+                self._receive_executor.shutdown(wait=True, cancel_futures=True)
+            for future in self._receive_futures.values():
+                if not future.cancelled() and future.exception() is None:
+                    payload = future.result()
+                    if payload.ready is not None:
+                        payload.ready.synchronize()
+            self._receive_futures.clear()
+            self._receive_cancels.clear()
+            self._ready_legacy_kv.clear()
             self.shutdown_prefetch()
         finally:
             connector = self._connector
@@ -1414,6 +1582,7 @@ class OmniKVTransferManager:
         *,
         sender_info: dict[str, Any] | None = None,
         timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[dict[str, Any] | None, int]:
         """Receive KV cache for *request_id*; returns (data dict, size) or (None, 0).
 
@@ -1467,6 +1636,8 @@ class OmniKVTransferManager:
 
         try:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return None, 0
                 link_start = time.perf_counter()
                 for get_key, from_rank in list(pending_pairs):
                     rank_metadata: dict[str, Any] | None = None
@@ -1570,7 +1741,10 @@ class OmniKVTransferManager:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
                     return None, 0
 
-                time.sleep(poll_interval)
+                if cancel_event is not None:
+                    cancel_event.wait(min(poll_interval, 0.001))
+                else:
+                    time.sleep(poll_interval)
                 poll_interval = min(poll_interval * 2, max_poll_interval)
 
         except KVPrefetchConsumeError:
@@ -1891,7 +2065,10 @@ class OmniKVTransferManager:
         """
         pt = self.topo_config
         group = pt.tp_group
-        if not (pt.is_local and pt.tp_active) or group is None or pt.tp_size <= 1:
+        # PP0's shard readers must agree before forwarding their payloads to
+        # the remaining PP stages, just as independent pure-TP readers do.
+        local_reader = pt.is_local or (pt.is_leader and pt.pp_size > 1)
+        if not (local_reader and pt.tp_active) or group is None or pt.tp_size <= 1:
             return received
         if not self.config.need_recv_cache:
             return received
@@ -1929,6 +2106,10 @@ class OmniKVTransferManager:
         target_device: torch.device | None = None,
     ) -> bool:
         """Synchronous receive: fetch → distribute → apply (FOLLOWER skips fetch)."""
+        if not self.config.need_recv_cache and not (
+            cfg_kv_collect_func and getattr(req.sampling_params, "cfg_kv_request_ids", None)
+        ):
+            return False
         received = False
         if not self.topo_config.is_follower:
             received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
@@ -1995,8 +2176,12 @@ class OmniKVTransferManager:
 
         device = target_device if target_device is not None else torch.device("cpu")
         # TP + CFG/SP
-        if pt.tp_active and (pt.cfg_active or pt.sp_active):
+        if pt.tp_active and (pt.cfg_active or pt.sp_active or pt.pp_size > 1):
             kv_payload: dict[str, object] | None = None
+            if pt.pp_rank != 0:
+                # PP0 first distributes each TP shard across its CFG/SP
+                # coordinates; the matching PP group then fans it downstream.
+                return self._broadcast_kv_payload(pt.pp_group, None, device, src=0) or None
             if pt.is_leader:
                 if pt.cfg_active:
                     payloads = (
@@ -2004,7 +2189,7 @@ class OmniKVTransferManager:
                     )
                     kv_payload = payloads[0]
                     self._cfg_scatter(pt.cfg_group, payloads, pt.cfg_size, device, self._resolve_request_id(req))
-                elif pt.sp_active:
+                else:
                     kv_payload = self._collect_request_kv_payload(req) if received else None
                 if pt.sp_active and pt.sp_group is not None:
                     kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, device, src=0)
@@ -2016,6 +2201,8 @@ class OmniKVTransferManager:
             else:
                 logger.error("distribute_kv_cache: unexpected role %s in TP+CFG/SP path", pt.role)
                 return None
+            if pt.pp_size > 1:
+                kv_payload = self._broadcast_kv_payload(pt.pp_group, kv_payload, device, src=0)
             return kv_payload or None
 
         # TP inactive, world broadcast

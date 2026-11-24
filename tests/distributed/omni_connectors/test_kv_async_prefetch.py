@@ -209,7 +209,7 @@ def test_start_prefetch_sweeps_orphan():
 
 
 def test_manager_close_stops_prefetch_before_connector_and_is_idempotent():
-    receiver = object.__new__(OmniKVTransferManager)
+    receiver = OmniKVTransferManager(OmniKVCacheConfig())
     events = []
     receiver.shutdown_prefetch = lambda: events.append("prefetch")
     receiver._connector = SimpleNamespace(close=lambda: events.append("connector"))
@@ -220,7 +220,7 @@ def test_manager_close_stops_prefetch_before_connector_and_is_idempotent():
 
 
 def test_manager_close_does_not_initialize_unused_connector():
-    receiver = object.__new__(OmniKVTransferManager)
+    receiver = OmniKVTransferManager(OmniKVCacheConfig())
     receiver.shutdown_prefetch = lambda: None
     receiver._connector = None
     receiver.close()

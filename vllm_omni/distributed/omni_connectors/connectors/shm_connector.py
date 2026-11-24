@@ -67,9 +67,11 @@ class SharedMemoryConnector(OmniConnectorBase):
         """Publish payload bytes while the caller holds the segment lock."""
         return shm_write_bytes(payload, name=name)
 
-    def _read_bytes(self, metadata: dict[str, Any]) -> bytes:
+    def _read_bytes(self, metadata: dict[str, Any], *, unlink: bool = True) -> bytes:
         """Read logical payload bytes and unlink under the segment lock."""
-        return shm_read_bytes(metadata)
+        if unlink:
+            return shm_read_bytes(metadata)
+        return shm_read_bytes(metadata, unlink=False)
 
     def _unlink_segment(self, name: str) -> None:
         """Unlink a segment by its OS name; raise FileNotFoundError if absent."""
@@ -82,8 +84,9 @@ class SharedMemoryConnector(OmniConnectorBase):
             return None
         return self.get(from_stage, to_stage, get_key, metadata)
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, config: dict[str, Any], *, unlink_on_get: bool = True):
         self.config = config
+        self.unlink_on_get = unlink_on_get
         self.stage_id = config.get("stage_id", -1)
         # load_omni_transfer_config puts the scope in the edge's extra, which
         # the factory passes as this config.
@@ -276,8 +279,10 @@ class SharedMemoryConnector(OmniConnectorBase):
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                data_bytes = self._read_bytes(shm_handle)
-                consumed = True
+                data_bytes = (
+                    self._read_bytes(shm_handle) if self.unlink_on_get else self._read_bytes(shm_handle, unlink=False)
+                )
+                consumed = self.unlink_on_get
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self._serde.deserialize(data_bytes)
             result = (obj, len(data_bytes))
@@ -300,7 +305,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         name = self._shm_name(get_key)
         lock_file = self._lock_file(name)
         result = self._get_data_with_lock(lock_file, {"name": name})
-        if result is not None:
+        if result is not None and self.unlink_on_get:
             with self._pending_keys_lock:
                 self._pending_keys.pop(get_key, None)
         return result
@@ -320,7 +325,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 shm_handle = metadata["shm"]
                 lock_file = self._lock_file(shm_handle["name"])
                 result = self._get_data_with_lock(lock_file, shm_handle)
-                if result is not None:
+                if result is not None and self.unlink_on_get:
                     with self._pending_keys_lock:
                         self._pending_keys.pop(get_key, None)
             else:

@@ -16,6 +16,7 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
@@ -652,6 +653,53 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return self._kv_receive_progress.prepare(self._kv_connector, scheduler_output, timeout)
         return wait_for_kv_load(self._kv_connector, scheduler_output, timeout)
 
+    def poll_kv_transfers(self, output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Execute local KV work without a distributed collective or a forward."""
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress
+
+        result = BatchRunnerOutput.from_list([])
+        manager = self.kv_transfer_manager
+        if manager is not None:
+            for rid in output.finished_req_ids:
+                result.kv_shm_keys[rid] = manager.cancel_receive_kv(rid)
+            if output.kv_prefetch_job is not None:
+                result.kv_shm_keys[output.kv_prefetch_job["request_id"]] = manager.start_receive_kv_async(
+                    output.kv_prefetch_job, self._target_device
+                )
+            (result.kv_finished_req_ids, result.kv_failed_req_ids, result.kv_cancelled_req_ids) = (
+                manager.poll_legacy_kv()
+            )
+        if self._kv_connector is not None and (
+            output.kv_connector_metadata is not None
+            or output.kv_prefetch_connector_metadata is not None
+            or (output.kv_poll_only and self._kv_receive_progress is not None and self._kv_receive_progress.submitted)
+        ):
+            if self._kv_receive_progress is None:
+                self._kv_receive_progress = KVReceiveProgress()
+            timeout = self.od_config.kv_transfer_config.kv_connector_extra_config.get("transfer_timeout", 60.0)
+            current = replace(
+                output,
+                kv_required_request_ids=set(),
+                kv_transfer_request_ids=output.kv_transfer_request_ids - output.kv_prefetch_request_ids,
+            )
+            result.kv_connector_output = self._kv_receive_progress.prepare(self._kv_connector, current, timeout)
+            if output.kv_prefetch_connector_metadata is not None:
+                # Scheduler only stages B after every rank ACKed A in an
+                # earlier step. Keep their connector submissions separate.
+                prefetch = replace(
+                    current,
+                    kv_connector_metadata=output.kv_prefetch_connector_metadata,
+                    kv_transfer_request_ids=output.kv_prefetch_request_ids,
+                    kv_finished_request_ids=set(),
+                )
+                result.kv_connector_output = self._kv_receive_progress.prepare(self._kv_connector, prefetch, timeout)
+        # Scheduler delays native terminal notifications until receive ACKs
+        # cover all ranks, and forbids reusing the ID until these cleanup ACKs
+        # return. Thus no stale cleanup can remove a later allocation's rows.
+        self._cleanup_finished_step_requests(output)
+        result.kv_cleaned_req_ids = list(output.finished_req_ids)
+        return result
+
     def install_diffusion_kv_metadata(self, metadata: DiffusionKVMetadata) -> bool:
         return self.diffusion_kv_backend.install_diffusion_kv_metadata(metadata)
 
@@ -799,6 +847,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self._maybe_recv_stage_payload(req)
 
         if self.kv_transfer_manager is None:
+            self._initialize_generator(req.sampling_params)
+            return
+        if self.kv_transfer_manager.consume_received_kv(req):
             self._initialize_generator(req.sampling_params)
             return
         # Receive AR KV. Single-request execution can use the prefetch path:
@@ -1332,9 +1383,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
                 cfg_kv_collect_func = getattr(self.od_config, "cfg_kv_collect_func", None)
-                if self.kv_transfer_manager is not None and (
-                    self.kv_transfer_manager.config.need_recv_cache
-                    or (cfg_kv_collect_func is not None and getattr(new_state.sampling, "cfg_kv_request_ids", None))
+                if (
+                    self.kv_transfer_manager is not None
+                    and not self.kv_transfer_manager.consume_received_kv(state_req)
+                    and (
+                        self.kv_transfer_manager.config.need_recv_cache
+                        or (cfg_kv_collect_func is not None and getattr(new_state.sampling, "cfg_kv_request_ids", None))
+                    )
                 ):
                     # Disabled receive must skip distribution too: broadcasting
                     # None on world would synchronize otherwise independent PP stages.

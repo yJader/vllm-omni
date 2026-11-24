@@ -80,7 +80,13 @@ class StepScheduler(BaseScheduler):
             self._can_add_to_batch(self._request_states[request_id], ()) for request_id in self._waiting
         ):
             return 0.0
-        if self._finished_req_ids or self._kv_transfer_request_ids or self._kv_draining_requests:
+        if (
+            self._finished_req_ids
+            or self._kv_transfer_request_ids
+            or self._kv_draining_requests
+            or self._legacy_kv_loading
+            or self._kv_loading_request_ids
+        ):
             return 0.0
         deadlines = [progress.wait_deadline for progress in runnable if progress.wait_deadline is not None]
         if not deadlines:

@@ -117,6 +117,9 @@ Dense requests do not install paged metadata. Paged requests reject legacy
 dense KV payloads or stale/incomplete native metadata instead of silently
 falling back to dense execution.
 
+For asynchronous KV receives, the Scheduler releases pages only after every
+rank has completed receiving and acknowledged Worker cleanup.
+
 ### AR-to-DiT transfer contract
 
 When an AR stage and a DiT stage are deployed separately, the previous
