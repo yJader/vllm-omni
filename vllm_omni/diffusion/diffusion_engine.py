@@ -486,10 +486,12 @@ class DiffusionEngine:
             self.dp_concurrent = False
         parallel_config = getattr(self.od_config, "parallel_config", None)
         pipeline_parallel_size = max(1, int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1))
+        pipeline_cls = resolve_pipeline_cls(self.od_config)
         self._pipeline_async_enabled = (
             self.execution_mode == DiffusionExecutionMode.STEP_BATCH
             and pipeline_parallel_size > 1
             and callable(getattr(self.executor, "submit_step", None))
+            and (pipeline_cls is None or bool(getattr(pipeline_cls, "supports_step_pipeline_parallel", False)))
         )
         if self._pipeline_async_enabled:
             max_concurrent_batches = getattr(self.od_config, "max_concurrent_batches", None)
@@ -499,11 +501,10 @@ class DiffusionEngine:
             self.scheduler.max_num_resident_reqs = self.scheduler.max_num_running_reqs * self._max_concurrent_batches
         else:
             self._max_concurrent_batches = pipeline_parallel_size
-        self._pending_batches: deque[tuple[str, DiffusionSchedulerOutput, PipelineStepFutures]] = deque()
+        self._pending_batches: deque[tuple[DiffusionSchedulerOutput, PipelineStepFutures]] = deque()
         self._pp0_ready = True
         self._control_gate_closed = False
         self._pipeline_failure: BaseException | None = None
-        self._next_pipeline_batch_id = 0
         self._deferred_pipeline_aborts: set[str] = set()
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
@@ -770,7 +771,7 @@ class DiffusionEngine:
                     if self._pipeline_async_enabled and self._pending_batches:
                         # If head is ready, it will be retired at the top of the next iteration.
                         # If not ready, wait for completion events.
-                        if not self._pending_batches[0][2].step_done.done():
+                        if not self._pending_batches[0][1].step_done.done():
                             self._cv.wait()
                             continue
                         # Head is done; loop back to retire it at phase 1, then recheck stop_event.
@@ -832,8 +833,8 @@ class DiffusionEngine:
 
             if self._pipeline_async_enabled:
                 # PP async: submit and loop back immediately
-                if self._submit_pipeline_batch(sched_output):
-                    continue
+                self._submit_pipeline_batch(sched_output)
+                continue
             else:
                 # Sync execution
                 try:
@@ -897,11 +898,6 @@ class DiffusionEngine:
         # Phase 6: Shared exit cleanup
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
 
-    def _next_batch_id(self) -> str:
-        batch_id = f"pipeline-{self._next_pipeline_batch_id}"
-        self._next_pipeline_batch_id += 1
-        return batch_id
-
     def _pipeline_future_done(self, future: concurrent.futures.Future, *, is_pp0: bool = False) -> None:
         try:
             error = future.exception()
@@ -943,38 +939,24 @@ class DiffusionEngine:
                 and self.abort_queue.empty()
             )
 
-    def _submit_pipeline_batch(self, sched_output: DiffusionSchedulerOutput) -> bool:
-        self._emit_request_started_outputs(sched_output)
-        self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
-        if sched_output.is_empty:
-            finished_ids = {
-                request_id
-                for request_id in sched_output.finished_req_ids
-                if (state := self.scheduler.get_request_state(request_id)) is not None and state.is_finished()
-            }
-            self._emit_finished_outputs(finished_ids, None)
-            return False
-
+    def _submit_pipeline_batch(self, sched_output: DiffusionSchedulerOutput) -> None:
         self._prepare_kv_for_forward(sched_output)
         if not sched_output.scheduled_request_ids:
             runner_output = BatchRunnerOutput.from_list([])
             self._poll_native_kv()
             finished_ids = self.scheduler.update_from_output(sched_output, runner_output)
             self._emit_outputs(finished_ids, [], runner_output, worker_execution_completed=True)
-            return False
+            return
 
-        # TODO: The implementation sketch names scheduled_seq_groups; this API exposes request IDs.
         request_ids = sched_output.scheduled_request_ids
         with self._cv:
             if isinstance(self.scheduler, StepScheduler):
                 self.scheduler.mark_pipeline_inflight(request_ids)
             self._pp0_ready = False
             futures = self.executor.submit_step(sched_output)
-            batch_id = self._next_batch_id()
-            self._pending_batches.append((batch_id, sched_output, futures))
+            self._pending_batches.append((sched_output, futures))
         futures.pp0_done.add_done_callback(lambda future: self._pipeline_future_done(future, is_pp0=True))
         futures.step_done.add_done_callback(self._pipeline_future_done)
-        return True
 
     def _compute_wait_timeout(self) -> float | None:
         """Compute wait timeout for the busy loop. Caller must hold self._cv."""
@@ -1012,7 +994,7 @@ class DiffusionEngine:
 
     def _retire_ready_results(self) -> None:
         while self._pending_batches:
-            _, sched_output, futures = self._pending_batches[0]
+            sched_output, futures = self._pending_batches[0]
             if not futures.step_done.done():
                 return
             self._pending_batches.popleft()
@@ -1455,7 +1437,7 @@ class DiffusionEngine:
                             (self.stop_event is not None and self.stop_event.is_set())
                             or self._pipeline_failure is not None
                             or not self.abort_queue.empty()
-                            or self._pending_batches[0][2].step_done.done()
+                            or self._pending_batches[0][1].step_done.done()
                         ):
                             self._cv.wait(timeout=remaining)
             return operation()
@@ -2629,7 +2611,7 @@ class DiffusionEngine:
         if self._pipeline_async_enabled:
             in_flight_ids = {
                 request_id
-                for _, sched_output, _ in self._pending_batches
+                for sched_output, _ in self._pending_batches
                 for request_id in sched_output.scheduled_request_ids
             }
             deferred_ids = set(request_ids).intersection(in_flight_ids)

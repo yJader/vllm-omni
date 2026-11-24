@@ -53,7 +53,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
 )
 from vllm.sequence import IntermediateTensors
@@ -2238,9 +2237,6 @@ class HunyuanImage3Model(nn.Module):
         self.pre_processor = HunyuanImagePreprocessor()
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size
-        )
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads

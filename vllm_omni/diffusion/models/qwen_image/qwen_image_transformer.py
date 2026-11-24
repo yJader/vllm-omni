@@ -1506,8 +1506,9 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # This ensures modulate_index sequence dimension matches sharded hidden_states
         timestep, modulate_index = self.modulate_index_prepare(timestep, img_shapes)
 
-        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
-        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+        if is_pipeline_first_stage():
+            encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+            encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000

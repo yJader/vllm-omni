@@ -64,7 +64,6 @@ def _make_engine(loop: asyncio.AbstractEventLoop, *, max_concurrent_batches: int
     engine._pp0_ready = True
     engine._control_gate_closed = False
     engine._pipeline_failure = None
-    engine._next_pipeline_batch_id = 0
     engine._deferred_pipeline_aborts = set()
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
@@ -292,3 +291,113 @@ async def test_engine_shutdown_drains_submitted_pipeline_batches():
         assert engine.scheduler.has_requests() is False
     finally:
         _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_step_pp_emits_request_started_once():
+    engine = _make_engine(asyncio.get_running_loop())
+    request = OmniDiffusionRequest(
+        request_id="req-lifecycle",
+        prompt="test",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, emit_request_lifecycle=True),
+    )
+    engine.add_request(request)
+    stream = engine._out_streams["req-lifecycle"]
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        _, pp0_done, step_done = engine.executor.batches[0]
+        pp0_done.set_result(None)
+        step_done.set_result(_step_output("req-lifecycle"))
+        await _wait_until(lambda: not engine.scheduler.has_requests())
+
+        items = []
+        while not stream.empty():
+            items.append(stream.get_nowait())
+        assert [item.request_started for item in items] == [True, False]
+        assert [item.finished for item in items] == [False, True]
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_deferred_abort_in_flight_batch_retires_as_aborted():
+    engine = _make_engine(asyncio.get_running_loop())
+    engine.od_config.max_num_seqs = 2
+    engine.scheduler.max_num_running_reqs = 2
+    engine.scheduler.max_num_resident_reqs = 4
+
+    for rid in ("a", "b"):
+        engine.add_request(
+            OmniDiffusionRequest(
+                request_id=rid,
+                prompt="test",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+            )
+        )
+    stream_a = engine._out_streams["a"]
+    stream_b = engine._out_streams["b"]
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        sched_0, pp0_0, step_0 = engine.executor.batches[0]
+        assert sched_0.scheduled_request_ids == ["a", "b"]
+
+        engine.abort("a")
+        await asyncio.sleep(0.03)
+        # Abort of an in-flight batch member stays deferred until step retirement.
+        assert stream_a.empty()
+        assert "a" in engine._deferred_pipeline_aborts
+
+        pp0_0.set_result(None)
+        step_0.set_result(
+            BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(request_id="a", step_index=1, finished=False),
+                    RunnerOutput(request_id="b", step_index=1, finished=False),
+                ]
+            )
+        )
+        await _wait_until(lambda: len(engine.executor.batches) == 2)
+        out_a = stream_a.get_nowait()
+        assert out_a.aborted is True
+        assert out_a.finished is True
+        assert "a" not in engine._deferred_pipeline_aborts
+
+        sched_1, pp0_1, step_1 = engine.executor.batches[1]
+        assert sched_1.scheduled_request_ids == ["b"]
+        pp0_1.set_result(None)
+        step_1.set_result(_step_output("b"))
+        await _wait_until(lambda: not engine.scheduler.has_requests())
+        out_b = stream_b.get_nowait()
+        assert out_b.aborted is False
+        assert out_b.finished is True
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.parametrize(
+    ("pipeline_cls", "expected"),
+    [
+        (type("_SupportedPipeline", (), {"supports_step_pipeline_parallel": True}), True),
+        (type("_UnsupportedPipeline", (), {"supports_step_pipeline_parallel": False}), False),
+        (type("_PlainPipeline", (), {}), False),
+        (None, True),
+    ],
+)
+def test_pipeline_async_requires_supports_step_pipeline_parallel(monkeypatch, pipeline_cls, expected):
+    import vllm_omni.diffusion.diffusion_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "resolve_pipeline_cls", lambda _od_config: pipeline_cls)
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig(
+        model="test",
+        step_execution=True,
+        parallel_config={"pipeline_parallel_size": 2},
+    )
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    engine.executor = _PipelineExecutor()
+    engine.scheduler = StepScheduler()
+    engine.scheduler.initialize(engine.od_config)
+
+    engine._init_runtime_state()
+
+    assert engine._pipeline_async_enabled is expected

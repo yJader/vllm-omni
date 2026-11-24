@@ -516,8 +516,8 @@ class GroupCoordinator:
                 continue
             group = self.cpu_group if tensor.is_cpu else self.device_group
             handles.append(torch.distributed.isend(tensor, dst=self.ranks[dst], group=group))
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            if not tensor.is_cpu:
+                tensor.record_stream(torch.accelerator.current_stream(tensor.device))
         return [_PendingSend(handles, tuple(buffers))]
 
     def isend_tensor(
@@ -527,7 +527,7 @@ class GroupCoordinator:
     ) -> list[torch.distributed.Work]:
         """Start a non-blocking send when the receiver already knows the shape.
 
-        Request-mode feedback uses a fixed latent shape on both PP ranks. It
+        Step-PP feedback uses a fixed latent shape on both PP ranks. It
         can therefore skip the blocking CPU metadata exchange performed by
         :meth:`isend_tensor_dict`, which otherwise prevents the next request's
         stage-0 forward from overlapping the current stage-1 forward.
@@ -539,8 +539,8 @@ class GroupCoordinator:
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
         group = self.cpu_group if tensor.is_cpu else self.device_group
         handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)
-        if tensor.is_cuda:
-            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        if not tensor.is_cpu:
+            tensor.record_stream(torch.accelerator.current_stream(tensor.device))
         return [handle]
 
     def irecv_tensor(
