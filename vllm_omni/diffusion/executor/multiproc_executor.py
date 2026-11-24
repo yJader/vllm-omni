@@ -213,7 +213,15 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
     def _init_result_queue(self, result_handle: Handle | None) -> MessageQueue:
         if result_handle is None:
             raise RuntimeError("Failed to get result queue handle from workers")
-        return MessageQueue.create_from_handle(result_handle, 0)
+        result_mq = MessageQueue.create_from_handle(result_handle, 0)
+        if (
+            self.od_config.step_execution
+            and getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) > 1
+            and result_mq._spin_condition is not None
+        ):
+            # Let the scheduler run after an entry ACK by parking idle result pumps.
+            result_mq._spin_condition.busy_loop_s = 0.0
+        return result_mq
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -772,7 +780,7 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
 
         Returns independent futures:
         * ``pp0_done``: PP0 (first stage) finishes local compute, can accept next batch.
-        * ``step_done``: Last stage produces final ``BaseRunnerOutput`` with updated latents.
+        * ``step_done``: Last stage finishes device execution and produces ``BaseRunnerOutput``.
 
         When PP=1, both complete together (fallback to synchronous execute_step).
         """
@@ -811,15 +819,16 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         def _chain_completion(f: concurrent.futures.Future) -> None:  # type: ignore[type-arg]
             entry_fut = futs[ids["entry"]]
             if not entry_fut.done():
-                exc = f.exception()
+                exc = concurrent.futures.CancelledError() if f.cancelled() else f.exception()
                 if exc is not None:
                     try_set_exception(entry_fut, exc)
                 else:
                     try_set_result(entry_fut, None)
 
-        futs[ids["result"]].add_done_callback(_chain_completion)
+        step_done = futs[ids["result"]]
+        step_done.add_done_callback(_chain_completion)
 
-        return PipelineStepFutures(pp0_done=futs[ids["entry"]], step_done=futs[ids["result"]])
+        return PipelineStepFutures(pp0_done=futs[ids["entry"]], step_done=step_done)
 
     def collective_rpc(
         self,
@@ -1239,12 +1248,10 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             self._result_mqs = []
             self._result_pump_threads = []
             with self._futures_lock:
-                for fut in self._rpc_futures.values():
-                    if not fut.done():
-                        try_set_exception(fut, RuntimeError("Executor shut down"))
-                for fut in self._output_futures.values():
-                    if not fut.done():
-                        try_set_exception(fut, RuntimeError("Executor shut down"))
+                pending_futures: list[concurrent.futures.Future[Any]] = [
+                    *self._rpc_futures.values(),
+                    *self._output_futures.values(),
+                ]
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
@@ -1252,6 +1259,9 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
                 # do not survive shutdown (issue #6413).
                 self._completed_outputs.clear()
                 self._dropped_output_ids.clear()
+            for fut in pending_futures:
+                if not fut.done():
+                    try_set_exception(fut, RuntimeError("Executor shut down"))
             self._processes = (cleaner.processes or []) if cleaner is not None else []
             if not self._processes:
                 self._shutdown_cleaner = None

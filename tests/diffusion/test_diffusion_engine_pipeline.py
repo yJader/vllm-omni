@@ -44,7 +44,7 @@ class _PipelineExecutor:
         return None
 
 
-def _make_engine(loop: asyncio.AbstractEventLoop) -> DiffusionEngine:
+def _make_engine(loop: asyncio.AbstractEventLoop, *, max_concurrent_batches: int = 2) -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(
         streaming_output=False,
@@ -54,10 +54,10 @@ def _make_engine(loop: asyncio.AbstractEventLoop) -> DiffusionEngine:
     engine.executor = _PipelineExecutor()
     engine.scheduler = StepScheduler()
     engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
-    engine.scheduler.max_num_resident_reqs = 2
+    engine.scheduler.max_num_resident_reqs = max_concurrent_batches
     engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
     engine._pipeline_async_enabled = True
-    engine._max_concurrent_batches = 2
+    engine._max_concurrent_batches = max_concurrent_batches
     engine._pending_batches = deque()
     engine._pp0_ready = True
     engine._control_gate_closed = False
@@ -173,6 +173,41 @@ async def test_pp0_readiness_submits_next_request_before_fifo_result_retirement(
         assert result_a.finished and result_b.finished
         assert engine.scheduler.has_requests() is False
     finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_c8_dispatches_waiting_request_until_continuation_latent_is_ready():
+    engine = _make_engine(asyncio.get_running_loop(), max_concurrent_batches=8)
+    batches = engine.executor.batches
+    try:
+        for request_id, size, steps in (("q0", 1024, 2), ("q1", 512, 1), ("q2", 768, 1)):
+            engine.add_request(
+                OmniDiffusionRequest(
+                    request_id=request_id,
+                    prompt="test",
+                    sampling_params=OmniDiffusionSamplingParams(height=size, width=size, num_inference_steps=steps),
+                )
+            )
+        await _wait_until(lambda: len(batches) == 1)
+        assert batches[0][0].scheduled_request_ids == ["q0"]
+        batches[0][1].set_result(None)
+        await _wait_until(lambda: len(batches) == 2)
+        assert batches[1][0].scheduled_request_ids == ["q1"]
+        batches[1][1].set_result(None)
+        await _wait_until(lambda: len(batches) == 3)
+        assert batches[2][0].scheduled_request_ids == ["q2"]
+
+        batches[0][2].set_result(BatchRunnerOutput.from_list([RunnerOutput("q0", step_index=1, finished=False)]))
+        batches[2][1].set_result(None)
+        await _wait_until(lambda: len(batches) == 4)
+        assert batches[3][0].scheduled_cached_reqs.request_ids == ["q0"]
+    finally:
+        for batch, entry, result in list(batches):
+            if not entry.done():
+                entry.set_result(None)
+            if not result.done():
+                result.set_result(_step_output(batch.scheduled_request_ids[0]))
         _stop_engine(engine)
 
 

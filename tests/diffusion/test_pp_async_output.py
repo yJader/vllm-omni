@@ -64,6 +64,84 @@ def _output(request_id, *, finished=True, dtype=torch.float32):
     )
 
 
+def test_last_stage_defers_non_terminal_result_until_device_event_without_blocking_next_rpc(monkeypatch):
+    step0 = _output("q0", finished=False)
+    step1 = _output("q1", finished=False)
+    step2 = _output("q2", finished=False)
+    proc, stream = _worker(monkeypatch, iter([step0, step1, step2]))
+    monkeypatch.setattr(
+        worker_module.current_omni_platform,
+        "record_device_event",
+        MagicMock(side_effect=AssertionError("non-terminal steps must not use blocking D2H record_device_event")),
+    )
+    pack = MagicMock(side_effect=AssertionError("non-terminal steps have no output tensors to pack"))
+    monkeypatch.setattr(worker_module, "pack_diffusion_output_shm", pack)
+
+    event0, event1 = MagicMock(), MagicMock()
+    worker_module.torch.Event.side_effect = [event0, event1]
+    entered, release = threading.Event(), threading.Event()
+
+    def synchronize_event0():
+        entered.set()
+        assert release.wait(2)
+
+    event0.synchronize.side_effect = synchronize_event0
+
+    _rpc(proc, "r0")
+    event0.record.assert_called_once()
+    assert proc.result_mq.empty()
+
+    background = threading.Thread(target=proc._async_output_loop, daemon=True)
+    background.start()
+    try:
+        assert entered.wait(2)
+        assert proc.drain_async_outputs(timeout=0) is False
+        assert proc.result_mq.empty()
+
+        # Worker RPC loop accepts the next step while r0 waits on its device event.
+        _rpc(proc, "r1")
+        event1.record.assert_called_once()
+        assert proc.result_mq.empty()
+
+        release.set()
+        reply0 = proc.result_mq.get(timeout=2)
+        reply1 = proc.result_mq.get(timeout=2)
+        assert isinstance(reply0, RpcReply) and reply0.rpc_id == "r0" and reply0.result is step0
+        assert isinstance(reply1, RpcReply) and reply1.rpc_id == "r1" and reply1.result is step1
+        event1.synchronize.assert_called_once()
+        stream.wait_event.assert_not_called()
+        stream.synchronize.assert_not_called()
+        assert proc.drain_async_outputs(timeout=1)
+
+        # Without an accelerator, non-terminal replies fall back to immediate delivery.
+        worker_module.torch.accelerator.is_available.return_value = False
+        _rpc(proc, "r2")
+        reply2 = proc.result_mq.get_nowait()
+        assert isinstance(reply2, RpcReply) and reply2.rpc_id == "r2" and reply2.result is step2
+        assert proc._async_output_queue.empty()
+    finally:
+        release.set()
+        proc._async_output_queue.put(None)
+        background.join(2)
+
+
+def test_deferred_step_event_failure_completes_result_role_with_error(monkeypatch):
+    proc, _ = _worker(monkeypatch, iter([_output("q0", finished=False)]))
+    failing_event = MagicMock()
+    failing_event.synchronize.side_effect = RuntimeError("device step failed")
+    worker_module.torch.Event.return_value = failing_event
+
+    _rpc(proc, "r0")
+    assert proc.result_mq.empty()
+    proc._async_output_queue.put(None)
+    proc._async_output_loop()
+
+    reply = proc.result_mq.get_nowait()
+    assert isinstance(reply, RpcReply) and reply.rpc_id == "r0"
+    assert reply.error and "device step failed" in reply.error
+    assert proc.drain_async_outputs(timeout=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_terminal_pack_does_not_block_next_step_and_preserves_output(monkeypatch, dtype):
     monkeypatch.setattr(diffusion_ipc, "_SHM_TENSOR_THRESHOLD", 1)
@@ -71,6 +149,8 @@ def test_terminal_pack_does_not_block_next_step_and_preserves_output(monkeypatch
     expected = terminal.runner_outputs[0].result.output.clone()
     next_step = _output("q1", finished=False)
     proc, stream = _worker(monkeypatch, iter([terminal, next_step]))
+    next_event = MagicMock()
+    worker_module.torch.Event.return_value = next_event
     entered, release = threading.Event(), threading.Event()
 
     def pack(output, **kwargs):
@@ -91,10 +171,11 @@ def test_terminal_pack_does_not_block_next_step_and_preserves_output(monkeypatch
         background.start()
         assert entered.wait(1)
         assert proc.drain_async_outputs(timeout=0) is False
-        _rpc(proc, "r1")
-        reply = proc.result_mq.get(timeout=1)
-        assert isinstance(reply, RpcReply) and reply.rpc_id == "r1"
-        assert reply.result is next_step
+        next_producer = threading.Thread(target=_rpc, args=(proc, "r1"), daemon=True)
+        next_producer.start()
+        next_producer.join(0.5)
+        assert not next_producer.is_alive(), "next non-terminal RPC must not block behind terminal packing"
+        next_event.record.assert_called_once()
         assert proc.result_mq.empty()
         release.set()
         reply = proc.result_mq.get(timeout=2)
@@ -104,12 +185,18 @@ def test_terminal_pack_does_not_block_next_step_and_preserves_output(monkeypatch
         assert torch.equal(reply.result.runner_outputs[0].result.output, expected)
         assert reply.result.runner_outputs[0].result.output.dtype == dtype
         assert reply.result.runner_outputs[0].request_id == "q0"
+        next_reply = proc.result_mq.get(timeout=2)
+        assert isinstance(next_reply, RpcReply) and next_reply.rpc_id == "r1" and next_reply.error is None
+        assert next_reply.result is next_step
         assert proc.drain_async_outputs(timeout=1)
         stream.wait_event.assert_called_once()
         stream.synchronize.assert_called_once()
+        next_event.synchronize.assert_called_once()
     finally:
         release.set()
         producer.join(2)
+        if "next_producer" in locals():
+            next_producer.join(2)
         proc._async_output_queue.put(None)
         if "background" in locals():
             background.join(2)
