@@ -240,6 +240,70 @@ async def test_worker_control_rpc_drains_submitted_pipeline_batches():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fails_at_entry", [True, False])
+async def test_pipeline_failure_during_control_drain_propagates_to_rpc_and_request(fails_at_entry):
+    engine = _make_engine(asyncio.get_running_loop())
+    output = _add_request(engine, "a")
+    error = ValueError("pipeline worker failed")
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        _, pp0_done, step_done = engine.executor.batches[0]
+        if not fails_at_entry:
+            pp0_done.set_result(None)
+        task = _RpcTask(method="update_weights", args=(), kwargs=None, deadline=None, unique_reply_rank=None)
+        with engine._cv:
+            engine._rpc_queue.put(task)
+            engine._cv.notify_all()
+        await _wait_until(lambda: engine._control_gate_closed)
+
+        failed_future = pp0_done if fails_at_entry else step_done
+        failed_future.set_exception(error)
+
+        await _wait_until(lambda: not engine.worker_thread.is_alive())
+        assert task.future.exception(timeout=0) is error
+        assert engine.executor.rpc_calls == []
+        assert engine._shutdown_complete
+        assert (await asyncio.wait_for(output.get(), timeout=1)).error == str(error)
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_late_rpc_enqueued_during_pipeline_failure_shutdown_is_failed_not_executed():
+    engine = _make_engine(asyncio.get_running_loop())
+    _add_request(engine, "a")
+    error = ValueError("pipeline worker failed")
+    late_task = _RpcTask(method="late_rpc", args=(), kwargs=None, deadline=None, unique_reply_rank=None)
+    late_enqueued = False
+
+    def _shutdown_and_enqueue_late_rpc() -> None:
+        nonlocal late_enqueued
+        if not late_enqueued:
+            late_enqueued = True
+            engine._rpc_queue.put(late_task)
+
+    engine.executor.shutdown = _shutdown_and_enqueue_late_rpc
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        _, pp0_done, step_done = engine.executor.batches[0]
+        pp0_done.set_result(None)
+        task = _RpcTask(method="update_weights", args=(), kwargs=None, deadline=None, unique_reply_rank=None)
+        with engine._cv:
+            engine._rpc_queue.put(task)
+            engine._cv.notify_all()
+        await _wait_until(lambda: engine._control_gate_closed)
+
+        step_done.set_exception(error)
+
+        await _wait_until(lambda: not engine.worker_thread.is_alive())
+        assert task.future.exception(timeout=0) is error
+        assert isinstance(late_task.future.exception(timeout=0), RuntimeError)
+        assert engine.executor.rpc_calls == []
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
 async def test_pause_scheduler_drains_pipeline_batches_and_returns_none():
     engine = _make_engine(asyncio.get_running_loop())
     output = _add_request(engine, "a")
