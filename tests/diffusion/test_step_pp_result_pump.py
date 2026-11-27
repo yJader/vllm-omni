@@ -125,3 +125,96 @@ def test_step_pp_shutdown_fails_pending_futures(monkeypatch):
     finally:
         if not executor._closed:
             executor.shutdown()
+
+
+def test_execute_step_waits_for_last_stage_reply_in_step_pp(monkeypatch):
+    import threading
+
+    writers = [MessageQueue(n_reader=1, n_local_reader=1, max_chunk_bytes=4096, max_chunks=4) for _ in range(2)]
+    handles = [writer.export_handle() for writer in writers]
+    expected = BatchRunnerOutput.from_list([])
+    roles: dict[str, str] = {}
+    pp0_replied = threading.Event()
+
+    def enqueue(message, **kwargs):
+        if isinstance(message, dict) and "reply_roles" in message:
+            roles.update(message["reply_roles"])
+            writers[0].enqueue(RpcReply(rpc_id=roles["entry"], result=None))
+            pp0_replied.set()
+
+    broadcast = SimpleNamespace(export_handle=lambda: None, enqueue=enqueue)
+    monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_broadcast_queue", lambda *_: broadcast)
+    monkeypatch.setattr(MultiprocDiffusionExecutor, "_launch_workers", lambda *_: ([], handles))
+    monkeypatch.setattr(MultiprocDiffusionExecutor, "_start_worker_monitor", lambda _: None)
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = SimpleNamespace(
+        num_gpus=2,
+        step_execution=True,
+        parallel_config=DiffusionParallelConfig(pipeline_parallel_size=2),
+    )
+    executor._init_executor()
+    result_box: list[object] = []
+    error_box: list[BaseException] = []
+
+    def run_execute_step():
+        try:
+            result_box.append(executor.execute_step(SimpleNamespace(scheduled_request_ids=["warmup"])))
+        except BaseException as exc:  # noqa: BLE001
+            error_box.append(exc)
+
+    try:
+        worker = threading.Thread(target=run_execute_step, daemon=True)
+        worker.start()
+        assert pp0_replied.wait(2)
+        worker.join(timeout=0.05)
+        # PP0 replied, but execute_step must keep waiting for the last stage.
+        assert worker.is_alive()
+
+        writers[1].enqueue(RpcReply(rpc_id=roles["result"], result=expected))
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert not error_box
+        assert result_box == [expected]
+
+        # Last-stage error must propagate out of execute_step.
+        roles.clear()
+        pp0_replied.clear()
+        error_worker = threading.Thread(target=run_execute_step, daemon=True)
+        error_worker.start()
+        assert pp0_replied.wait(2)
+        writers[1].enqueue(RpcReply(rpc_id=roles["result"], error="last stage decode OOM"))
+        error_worker.join(timeout=2)
+        assert not error_worker.is_alive()
+        assert len(error_box) == 1 and "last stage decode OOM" in str(error_box[0])
+    finally:
+        executor.shutdown()
+
+
+def test_execute_step_pp1_uses_sync_collective_rpc(monkeypatch):
+    expected = BatchRunnerOutput.from_list([])
+    rpc_calls: list[tuple[str, dict]] = []
+
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._closed = False
+    executor._result_mq = object()
+    executor._broadcast_mq = object()
+    executor.od_config = SimpleNamespace(
+        step_execution=True,
+        parallel_config=DiffusionParallelConfig(pipeline_parallel_size=1),
+    )
+
+    def fake_collective_rpc(method, **kwargs):
+        rpc_calls.append((method, kwargs))
+        return expected
+
+    monkeypatch.setattr(executor, "collective_rpc", fake_collective_rpc)
+    monkeypatch.setattr(
+        executor,
+        "submit_step",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("PP=1 must not call submit_step")),
+    )
+
+    assert executor.execute_step(SimpleNamespace(scheduled_request_ids=["q0"])) is expected
+    assert len(rpc_calls) == 1
+    assert rpc_calls[0][0] == "execute_stepwise"
+    assert rpc_calls[0][1]["unique_reply_rank"] == 0

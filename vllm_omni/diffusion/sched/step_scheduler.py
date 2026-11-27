@@ -43,9 +43,11 @@ class StepScheduler(BaseScheduler):
     def __init__(self) -> None:
         super().__init__()
         self._request_progress: dict[str, _StepProgress] = {}
+        self.step_pp_enabled: bool = False
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
+        self.step_pp_enabled = False
 
     def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
         progress = self._request_progress[state.request_id]
@@ -146,7 +148,7 @@ class StepScheduler(BaseScheduler):
         return request_id
 
     def _can_add_to_batch(self, state: SchedulerRequestState, selected_ids: Sequence[str]) -> bool:
-        if self.max_num_resident_reqs is None:
+        if not self.step_pp_enabled:
             return super()._can_add_to_batch(state, selected_ids)
 
         # Async PP can keep several independent batches resident.

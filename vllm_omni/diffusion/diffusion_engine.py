@@ -430,8 +430,37 @@ class DiffusionEngine:
             )
         return DiffusionExecutionMode.REQUEST_BATCH
 
+    def _resolve_pipeline_async_enabled(
+        self,
+        od_config: OmniDiffusionConfig,
+        executor_class_or_inst: type[DiffusionExecutor] | DiffusionExecutor,
+    ) -> bool:
+        parallel_config = getattr(od_config, "parallel_config", None)
+        pipeline_parallel_size = max(1, int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1))
+        step_pp_requested = self.execution_mode == DiffusionExecutionMode.STEP_BATCH and pipeline_parallel_size > 1
+        if not step_pp_requested:
+            return False
+
+        pipeline_cls = resolve_pipeline_cls(od_config)
+        supports_executor = bool(getattr(executor_class_or_inst, "supports_async_step_pp", False))
+        supports_model = bool(getattr(pipeline_cls, "supports_step_pipeline_parallel", False))
+        if not supports_executor or not supports_model:
+            raise ValueError(
+                "Step execution with pipeline_parallel_size > 1 requires "
+                "an executor and a model with asynchronous Step-PP support."
+            )
+
+        vae_patch_parallel_size = max(1, int(getattr(parallel_config, "vae_patch_parallel_size", 1) or 1))
+        if vae_patch_parallel_size > 1:
+            raise ValueError(
+                "Asynchronous Step-PP requires vae_patch_parallel_size=1 "
+                "because only the last PP stage decodes the output."
+            )
+        return True
+
     def _init_executor(self, od_config: OmniDiffusionConfig) -> None:
         executor_class = DiffusionExecutor.get_class(od_config)
+        self._pipeline_async_enabled = self._resolve_pipeline_async_enabled(od_config, executor_class)
         self.executor = executor_class(od_config)
         if od_config.streaming_output and not self.step_execution:
             self.executor.register_chunk_ready_handler(self._on_request_chunk_ready)
@@ -486,19 +515,16 @@ class DiffusionEngine:
             self.dp_concurrent = False
         parallel_config = getattr(self.od_config, "parallel_config", None)
         pipeline_parallel_size = max(1, int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1))
-        pipeline_cls = resolve_pipeline_cls(self.od_config)
-        self._pipeline_async_enabled = (
-            self.execution_mode == DiffusionExecutionMode.STEP_BATCH
-            and pipeline_parallel_size > 1
-            and callable(getattr(self.executor, "submit_step", None))
-            and (pipeline_cls is None or bool(getattr(pipeline_cls, "supports_step_pipeline_parallel", False)))
-        )
+        if not hasattr(self, "_pipeline_async_enabled"):
+            self._pipeline_async_enabled = self._resolve_pipeline_async_enabled(self.od_config, self.executor)
         if self._pipeline_async_enabled:
             max_concurrent_batches = getattr(self.od_config, "max_concurrent_batches", None)
             self._max_concurrent_batches = (
                 pipeline_parallel_size if max_concurrent_batches is None else int(max_concurrent_batches)
             )
             self.scheduler.max_num_resident_reqs = self.scheduler.max_num_running_reqs * self._max_concurrent_batches
+            if isinstance(self.scheduler, StepScheduler):
+                self.scheduler.step_pp_enabled = True
         else:
             self._max_concurrent_batches = pipeline_parallel_size
         self._pending_batches: deque[tuple[DiffusionSchedulerOutput, PipelineStepFutures]] = deque()

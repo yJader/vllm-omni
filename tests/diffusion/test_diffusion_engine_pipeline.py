@@ -25,6 +25,8 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 
 class _PipelineExecutor:
+    supports_async_step_pp: bool = True
+
     def __init__(self) -> None:
         self.batches: list[tuple[object, concurrent.futures.Future, concurrent.futures.Future]] = []
         self.rpc_calls: list[str] = []
@@ -57,6 +59,7 @@ def _make_engine(loop: asyncio.AbstractEventLoop, *, max_concurrent_batches: int
     engine.scheduler = StepScheduler()
     engine.scheduler.initialize(engine.od_config)
     engine.scheduler.max_num_resident_reqs = max_concurrent_batches
+    engine.scheduler.step_pp_enabled = True
     engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
     engine._pipeline_async_enabled = True
     engine._max_concurrent_batches = max_concurrent_batches
@@ -439,29 +442,120 @@ async def test_deferred_abort_in_flight_batch_retires_as_aborted():
 
 
 @pytest.mark.parametrize(
-    ("pipeline_cls", "expected"),
+    ("pipeline_cls", "executor_supports_async_pp", "vae_patch_parallel_size", "error_match"),
     [
-        (type("_SupportedPipeline", (), {"supports_step_pipeline_parallel": True}), True),
-        (type("_UnsupportedPipeline", (), {"supports_step_pipeline_parallel": False}), False),
-        (type("_PlainPipeline", (), {}), False),
-        (None, True),
+        (type("_SupportedPipeline", (), {"supports_step_pipeline_parallel": True}), True, 1, None),
+        (
+            type("_SupportedPipeline", (), {"supports_step_pipeline_parallel": True}),
+            False,
+            1,
+            "asynchronous Step-PP support",
+        ),
+        (
+            type("_UnsupportedPipeline", (), {"supports_step_pipeline_parallel": False}),
+            True,
+            1,
+            "asynchronous Step-PP support",
+        ),
+        (type("_PlainPipeline", (), {}), True, 1, "asynchronous Step-PP support"),
+        (None, True, 1, "asynchronous Step-PP support"),
+        (
+            type("_SupportedPipeline", (), {"supports_step_pipeline_parallel": True}),
+            True,
+            2,
+            "vae_patch_parallel_size=1",
+        ),
     ],
 )
-def test_pipeline_async_requires_supports_step_pipeline_parallel(monkeypatch, pipeline_cls, expected):
+def test_step_pp_startup_capability_validation(
+    monkeypatch,
+    pipeline_cls,
+    executor_supports_async_pp,
+    vae_patch_parallel_size,
+    error_match,
+):
     import vllm_omni.diffusion.diffusion_engine as engine_module
+    from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+
+    constructed = False
+
+    class _FakeExecutor:
+        supports_async_step_pp = executor_supports_async_pp
+
+        def __init__(self, _od_config) -> None:
+            nonlocal constructed
+            constructed = True
 
     monkeypatch.setattr(engine_module, "resolve_pipeline_cls", lambda _od_config: pipeline_cls)
+    monkeypatch.setattr(DiffusionExecutor, "get_class", staticmethod(lambda _od_config: _FakeExecutor))
+
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = OmniDiffusionConfig(
         model="test",
         step_execution=True,
-        parallel_config={"pipeline_parallel_size": 2},
+        parallel_config={
+            "pipeline_parallel_size": 2,
+            "vae_patch_parallel_size": vae_patch_parallel_size,
+        },
     )
     engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
-    engine.executor = _PipelineExecutor()
+    engine.step_execution = True
+
+    if error_match is not None:
+        with pytest.raises(ValueError, match=error_match):
+            engine._init_executor(engine.od_config)
+        assert not constructed
+        return
+
+    engine._init_executor(engine.od_config)
+    assert constructed
+    assert engine._pipeline_async_enabled is True
     engine.scheduler = StepScheduler()
     engine.scheduler.initialize(engine.od_config)
-
     engine._init_runtime_state()
+    assert engine.scheduler.step_pp_enabled is True
 
-    assert engine._pipeline_async_enabled is expected
+
+@pytest.mark.parametrize(
+    ("execution_mode", "pp_size", "expected_execute_method"),
+    [
+        (DiffusionExecutionMode.STEP_BATCH, 1, "execute_step"),
+        (DiffusionExecutionMode.REQUEST_BATCH, 2, "execute_batch"),
+    ],
+)
+def test_non_step_pp_modes_keep_sync_executor_path(monkeypatch, execution_mode, pp_size, expected_execute_method):
+    import vllm_omni.diffusion.diffusion_engine as engine_module
+    from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+
+    class _SyncOnlyExecutor:
+        supports_async_step_pp = False
+
+        def __init__(self, _od_config) -> None:
+            pass
+
+        def execute_step(self, _sched_output):
+            return None
+
+        def execute_batch(self, _sched_output):
+            return None
+
+    monkeypatch.setattr(engine_module, "resolve_pipeline_cls", lambda _od_config: None)
+    monkeypatch.setattr(DiffusionExecutor, "get_class", staticmethod(lambda _od_config: _SyncOnlyExecutor))
+
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig(
+        model="test",
+        step_execution=execution_mode == DiffusionExecutionMode.STEP_BATCH,
+        parallel_config={"pipeline_parallel_size": pp_size},
+    )
+    engine.execution_mode = execution_mode
+    engine.step_execution = execution_mode == DiffusionExecutionMode.STEP_BATCH
+    engine._init_executor(engine.od_config)
+    engine.scheduler = StepScheduler()
+    engine.scheduler.initialize(engine.od_config)
+    engine._init_runtime_state()
+    engine._init_execute_fn()
+
+    assert engine._pipeline_async_enabled is False
+    assert engine.scheduler.step_pp_enabled is False
+    assert engine.execute_fn.__name__ == expected_execute_method

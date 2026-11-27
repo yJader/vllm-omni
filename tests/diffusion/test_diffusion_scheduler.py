@@ -1994,6 +1994,7 @@ class TestStepScheduler:
     def test_pipeline_schedules_different_shape_while_first_step_is_in_flight(self) -> None:
         self.scheduler.max_num_running_reqs = 2
         self.scheduler.max_num_resident_reqs = 4
+        self.scheduler.step_pp_enabled = True
         for request_id, size in (("large", 1024), ("small-1", 512), ("small-2", 512)):
             self.scheduler.add_request(
                 _make_step_request(
@@ -2031,6 +2032,7 @@ class TestStepScheduler:
 
         self.scheduler.max_num_running_reqs = 2
         self.scheduler.max_num_resident_reqs = 4
+        self.scheduler.step_pp_enabled = True
 
         def _make_mf_req(req_id: str, height: int, width: int, image_tokens: int) -> OmniDiffusionRequest:
             req = _make_step_request(
@@ -2067,6 +2069,33 @@ class TestStepScheduler:
         third = self.scheduler.schedule()
         assert third.scheduled_request_ids == ["mf-d"]
         assert third.use_mixfusion is True
+
+    def test_resident_capacity_alone_keeps_running_compatibility_policy(self) -> None:
+        self.scheduler.max_num_running_reqs = 2
+        self.scheduler.max_num_resident_reqs = 2
+        # step_pp_enabled stays False: waiting requests must still match _running.
+        self.scheduler.add_request(
+            _make_step_request(
+                "req-a",
+                sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024, num_inference_steps=4),
+            )
+        )
+        first = self.scheduler.schedule()
+        assert first.scheduled_request_ids == ["req-a"]
+        self.scheduler.mark_pipeline_inflight(first.scheduled_request_ids)
+
+        self.scheduler.add_request(
+            _make_step_request(
+                "req-b",
+                sampling_params=OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=4),
+            )
+        )
+        assert self.scheduler.schedule().scheduled_request_ids == []
+
+        # Explicitly enabling step_pp_enabled switches compatibility to per-batch,
+        # even when max_num_resident_reqs equals max_num_running_reqs (max_concurrent_batches=1).
+        self.scheduler.step_pp_enabled = True
+        assert self.scheduler.schedule().scheduled_request_ids == ["req-b"]
 
     def test_admission_wait_is_not_supported(self) -> None:
         decision = self.scheduler.get_admission_wait_decision(

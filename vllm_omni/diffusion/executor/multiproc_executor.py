@@ -130,6 +130,7 @@ class _ExecutorShutdownCleaner:
 
 class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
     uses_multiproc: bool = True
+    supports_async_step_pp: bool = True
 
     # Class-level defaults so tests using object.__new__ (without _init_executor)
     # don't hit AttributeError when collective_rpc accesses these.
@@ -759,14 +760,20 @@ class MultiprocDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        pipeline_parallel_size = max(1, int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1))
         try:
-            result = self.collective_rpc(
-                "execute_stepwise",
-                args=(scheduler_output,),
-                unique_reply_rank=0,
-                exec_all_ranks=True,
-                timeout=_DLO_DP_WAVE_TIMEOUT_S,
-            )
+            if getattr(self.od_config, "step_execution", False) and pipeline_parallel_size > 1:
+                step_done = self.submit_step(scheduler_output).step_done
+                result = step_done.result(timeout=_DLO_DP_WAVE_TIMEOUT_S)
+            else:
+                result = self.collective_rpc(
+                    "execute_stepwise",
+                    args=(scheduler_output,),
+                    unique_reply_rank=0,
+                    exec_all_ranks=True,
+                    timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                )
         except TimeoutError as exc:
             self._fail_closed_on_dp_wave_timeout(exc)
             raise

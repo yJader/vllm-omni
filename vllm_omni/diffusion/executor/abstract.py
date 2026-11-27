@@ -44,6 +44,7 @@ class DiffusionExecutor(ABC):
     """Abstract base class for Diffusion executors."""
 
     uses_multiproc: bool = False
+    supports_async_step_pp: bool = False
 
     @staticmethod
     def get_class(od_config: OmniDiffusionConfig) -> type[DiffusionExecutor]:
