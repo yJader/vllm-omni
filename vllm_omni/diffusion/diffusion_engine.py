@@ -515,8 +515,6 @@ class DiffusionEngine:
             self.dp_concurrent = False
         parallel_config = getattr(self.od_config, "parallel_config", None)
         pipeline_parallel_size = max(1, int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1))
-        if not hasattr(self, "_pipeline_async_enabled"):
-            self._pipeline_async_enabled = self._resolve_pipeline_async_enabled(self.od_config, self.executor)
         if self._pipeline_async_enabled:
             max_concurrent_batches = getattr(self.od_config, "max_concurrent_batches", None)
             self._max_concurrent_batches = (
@@ -529,7 +527,6 @@ class DiffusionEngine:
             self._max_concurrent_batches = pipeline_parallel_size
         self._pending_batches: deque[tuple[DiffusionSchedulerOutput, PipelineStepFutures]] = deque()
         self._pp0_ready = True
-        self._control_gate_closed = False
         self._pipeline_failure: BaseException | None = None
         self._deferred_pipeline_aborts: set[str] = set()
         self.main_loop: asyncio.AbstractEventLoop | None = None
@@ -814,9 +811,12 @@ class DiffusionEngine:
                     continue
 
                 # PP mode: early check for submission eligibility
-                if self._pipeline_async_enabled:
-                    if not self._can_submit_batch() or not self._scheduler_has_runnable_work():
-                        continue
+                if self._pipeline_async_enabled and (
+                    not self._can_submit_batch_locked()
+                    or self.scheduler.get_execution_wait_timeout(time.monotonic()) != 0.0
+                    or getattr(self.scheduler, "_kv_draining_requests", None)
+                ):
+                    continue
 
                 self._wait_for_admission_if_needed_locked()
                 if self._scheduling_paused:
@@ -863,65 +863,64 @@ class DiffusionEngine:
                     self._fail_engine(exc)
                     return
                 continue
-            else:
-                # Sync execution
-                try:
-                    self._prepare_kv_for_forward(sched_output)
-                    runner_output: BaseRunnerOutput = (
-                        self.execute_fn(sched_output)
-                        if sched_output.scheduled_request_ids
-                        else BatchRunnerOutput.from_list([])
-                    )
-                    self._poll_native_kv()
-                    worker_execution_completed = True
-                except Exception as exc:
-                    # Shutdown can interrupt an in-flight executor call. Exit through
-                    # the loop tail so pending RPCs are failed instead of left waiting.
-                    if self._closed:
-                        break
-                    worker_execution_completed = False
-                    logger.error(
-                        "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
-                    )
-                    runner_output = BatchRunnerOutput.from_list(
-                        [
-                            RunnerOutput(
-                                request_id=request_id,
-                                step_index=None,
-                                finished=True,
-                                result=DiffusionOutput.from_exception(exc),
-                            )
-                            for request_id in sched_output.scheduled_request_ids
-                        ]
-                    )
 
-                self._process_aborts_queue()
-                try:
-                    # The runner may already have retired terminal state. Publish
-                    # that transition before delivering controls queued during execution.
-                    with self._cv:
-                        finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-                    self._process_rpc_queue()
-                    self._emit_outputs(
-                        finished_req_ids,
-                        sched_output.scheduled_request_ids,
-                        runner_output,
-                        worker_execution_completed=worker_execution_completed,
-                    )
-                except Exception as exc:
-                    self._fail_engine(exc)
-                    return
-                finally:
-                    # Streams/async workers own delivered outputs. Keeping this
-                    # local would also retain the previous video during execute_fn
-                    # on the next iteration. Do not mutate the shared result.
-                    del runner_output
+            try:
+                self._prepare_kv_for_forward(sched_output)
+                runner_output: BaseRunnerOutput = (
+                    self.execute_fn(sched_output)
+                    if sched_output.scheduled_request_ids
+                    else BatchRunnerOutput.from_list([])
+                )
+                self._poll_native_kv()
+                worker_execution_completed = True
+            except Exception as exc:
+                # Shutdown can interrupt an in-flight executor call. Exit through
+                # the loop tail so pending RPCs are failed instead of left waiting.
+                if self._closed:
+                    break
+                worker_execution_completed = False
+                logger.error(
+                    "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
+                )
+                runner_output = BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            request_id=request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(exc),
+                        )
+                        for request_id in sched_output.scheduled_request_ids
+                    ]
+                )
 
-                if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
-                    # Only exceptional in-flight receives need idle polling. New
-                    # requests / aborts wake this wait immediately.
-                    with self._cv:
-                        self._cv.wait(timeout=0.01)
+            self._process_aborts_queue()
+            try:
+                # The runner may already have retired terminal state. Publish
+                # that transition before delivering controls queued during execution.
+                with self._cv:
+                    finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                self._process_rpc_queue()
+                self._emit_outputs(
+                    finished_req_ids,
+                    sched_output.scheduled_request_ids,
+                    runner_output,
+                    worker_execution_completed=worker_execution_completed,
+                )
+            except Exception as exc:
+                self._fail_engine(exc)
+                return
+            finally:
+                # Streams/async workers own delivered outputs. Keeping this
+                # local would also retain the previous video during execute_fn
+                # on the next iteration. Do not mutate the shared result.
+                del runner_output
+
+            if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
+                # Only exceptional in-flight receives need idle polling. New
+                # requests / aborts wake this wait immediately.
+                with self._cv:
+                    self._cv.wait(timeout=0.01)
 
         # Phase 6: Shared exit cleanup
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
@@ -938,26 +937,15 @@ class DiffusionEngine:
                 self._pp0_ready = True
             self._cv.notify_all()
 
-    def _scheduler_has_runnable_work(self) -> bool:
-        with self._cv:
-            return self.scheduler.get_execution_wait_timeout(time.monotonic()) == 0.0 and not getattr(
-                self.scheduler, "_kv_draining_requests", None
-            )
-
-    def _can_submit_batch(self) -> bool:
-        with self._cv:
-            return (
-                self.stop_event is not None
-                and not self.stop_event.is_set()
-                and not self._closed
-                and not self._scheduling_paused
-                and not self._playback_blocked()
-                and self._pp0_ready
-                and len(self._pending_batches) < self._max_concurrent_batches
-                and not self._control_gate_closed
-                and self._rpc_queue.empty()
-                and self.abort_queue.empty()
-            )
+    def _can_submit_batch_locked(self) -> bool:
+        """Check PP batch submission eligibility. Caller must hold self._cv."""
+        return (
+            not self._closed
+            and not self._scheduling_paused
+            and not self._playback_blocked()
+            and self._pp0_ready
+            and len(self._pending_batches) < self._max_concurrent_batches
+        )
 
     def _submit_pipeline_batch(self, sched_output: DiffusionSchedulerOutput) -> None:
         self._prepare_kv_for_forward(sched_output)
@@ -985,7 +973,7 @@ class DiffusionEngine:
 
         if self._pipeline_async_enabled:
             # PP mode: consider scheduler + pending batches
-            if self._can_submit_batch() and self.scheduler.has_requests():
+            if self._can_submit_batch_locked() and self.scheduler.has_requests():
                 timeout = self.scheduler.get_execution_wait_timeout(now)
                 if timeout == 0.0 and getattr(self.scheduler, "_kv_draining_requests", None):
                     timeout = 0.01
@@ -1400,13 +1388,14 @@ class DiffusionEngine:
             elif task.method == "resume_scheduler":
                 self._open_scheduling_gate()
             else:
-                result = self._execute_control_rpc_with_drain(
-                    task.method,
-                    timeout=remaining,
+                self._drain_pending_batches(deadline=deadline)
+                rpc_timeout = self._remaining_rpc_timeout(remaining, deadline, task.method)
+                result = self.executor.collective_rpc(
+                    method=task.method,
+                    timeout=rpc_timeout,
                     args=task.args,
                     kwargs=task.kwargs,
                     unique_reply_rank=task.unique_reply_rank,
-                    deadline=deadline,
                 )
         except BaseException as exc:  # noqa: BLE001 - propagate to caller
             # The future may have been cancelled (e.g. by a sync timeout
@@ -1424,86 +1413,37 @@ class DiffusionEngine:
             if not fut.done():
                 fut.set_result(result)
 
-    def _execute_control_operation_with_drain(
-        self,
-        operation: Callable[[], Any],
-        *,
-        deadline: float | None = None,
-    ) -> Any:
+    def _drain_pending_batches(self, *, deadline: float | None = None) -> None:
+        """Retire all in-flight async PP batches before a synchronous control call."""
         if not self._pipeline_async_enabled:
-            return operation()
-
-        with self._cv:
-            owns_gate = not self._control_gate_closed
-            self._control_gate_closed = True
-            self._cv.notify_all()
-        try:
-            while self._pending_batches:
-                if self.stop_event is not None and self.stop_event.is_set():
-                    raise RuntimeError("DiffusionEngine is shutting down.")
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if remaining is not None and remaining <= 0:
-                    raise TimeoutError("Control RPC timed out while draining pipeline batches.")
-                self._process_aborts_queue()
-                previous_count = len(self._pending_batches)
-                self._retire_ready_results()
-                if len(self._pending_batches) == previous_count and self._pending_batches:
-                    with self._cv:
-                        if not (
-                            (self.stop_event is not None and self.stop_event.is_set())
-                            or self._pipeline_failure is not None
-                            or not self.abort_queue.empty()
-                            or self._pending_batches[0][1].step_done.done()
-                        ):
-                            self._cv.wait(timeout=remaining)
-            return operation()
-        finally:
-            if owns_gate:
+            return
+        while self._pending_batches:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise RuntimeError("DiffusionEngine is shutting down.")
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("Control RPC timed out while draining pipeline batches.")
+            self._process_aborts_queue()
+            previous_count = len(self._pending_batches)
+            self._retire_ready_results()
+            if len(self._pending_batches) == previous_count and self._pending_batches:
                 with self._cv:
-                    self._control_gate_closed = False
-                    self._cv.notify_all()
+                    if not (
+                        (self.stop_event is not None and self.stop_event.is_set())
+                        or self._pipeline_failure is not None
+                        or not self.abort_queue.empty()
+                        or self._pending_batches[0][1].step_done.done()
+                    ):
+                        self._cv.wait(timeout=remaining)
 
-    def _execute_control_rpc_with_drain(
-        self,
-        rpc_method: str,
-        *,
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict | None = None,
-        unique_reply_rank: int | None = None,
-        exec_all_ranks: bool = False,
-        deadline: float | None = None,
-    ) -> Any:
-        """Execute a worker RPC after retiring any in-flight async PP batches.
-
-        Synchronous execution calls the executor immediately. Async PP blocks
-        new batch submissions while draining and running the RPC.
-        A monotonic `deadline` covers both the drain and the RPC. Without one,
-        `timeout` applies only to the worker RPC.
-        """
-
-        def _execute() -> Any:
-            rpc_timeout = timeout
-            if deadline is not None:
-                rpc_timeout = deadline - time.monotonic()
-                if rpc_timeout <= 0:
-                    raise TimeoutError(f"RPC call to {rpc_method} timed out while draining pipeline batches.")
-            rpc_kwargs = kwargs
-            if self._pipeline_async_enabled and rpc_method == "synchronize_device" and kwargs and "timeout" in kwargs:
-                rpc_kwargs = {**kwargs, "timeout": rpc_timeout}
-            return self.executor.collective_rpc(
-                method=rpc_method,
-                timeout=rpc_timeout,
-                args=args,
-                kwargs=rpc_kwargs,
-                unique_reply_rank=unique_reply_rank,
-                exec_all_ranks=exec_all_ranks,
-            )
-
-        return self._execute_control_operation_with_drain(
-            _execute,
-            deadline=deadline,
-        )
+    @staticmethod
+    def _remaining_rpc_timeout(timeout: float | None, deadline: float | None, method: str) -> float | None:
+        if deadline is None:
+            return timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"RPC call to {method} timed out while draining pipeline batches.")
+        return remaining
 
     def _fail_pending_rpcs(self, exc: BaseException) -> None:
         while True:
@@ -1525,12 +1465,9 @@ class DiffusionEngine:
 
     def _run_pause_barrier(self, timeout: float | None, *, deadline: float | None = None) -> None:
         """Return once every worker has finished the device work of the batch that ran."""
-        self._execute_control_rpc_with_drain(
-            "synchronize_device",
-            timeout=timeout,
-            kwargs={"timeout": timeout},
-            deadline=deadline,
-        )
+        self._drain_pending_batches(deadline=deadline)
+        rpc_timeout = self._remaining_rpc_timeout(timeout, deadline, "synchronize_device")
+        self.executor.collective_rpc("synchronize_device", timeout=rpc_timeout, kwargs={"timeout": rpc_timeout})
 
     def _open_scheduling_gate(self) -> None:
         with self._cv:
@@ -1560,9 +1497,8 @@ class DiffusionEngine:
             cleanup_targets = target_builder(unique_request_ids) if target_builder is not None else unique_request_ids
             try:
                 if cleanup_targets:
-                    self._execute_control_operation_with_drain(
-                        lambda: self.executor.remove_diffusion_kv_requests(cleanup_targets)
-                    )
+                    self._drain_pending_batches()
+                    self.executor.remove_diffusion_kv_requests(cleanup_targets)
             except Exception as exc:
                 self._fail_engine(exc)
                 raise
@@ -1576,9 +1512,8 @@ class DiffusionEngine:
         ):
             return
         try:
-            output = self._execute_control_operation_with_drain(
-                lambda: self.executor.prepare_kv_for_forward(sched_output)
-            )
+            self._drain_pending_batches()
+            output = self.executor.prepare_kv_for_forward(sched_output)
             assert output is not None
             self.scheduler.update_kv_connector_output(output)
             if not self.abort_queue.empty():
@@ -1659,7 +1594,8 @@ class DiffusionEngine:
             return
         # Reuse the scheduler cleanup path on every rank, without a new forward.
         try:
-            self._execute_control_rpc_with_drain(
+            self._drain_pending_batches()
+            self.executor.collective_rpc(
                 "execute_stepwise",
                 args=(
                     DiffusionSchedulerOutput(

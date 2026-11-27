@@ -20,7 +20,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.forward_context import (
@@ -28,6 +27,7 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
 )
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
+from vllm_omni.diffusion.hooks.sequence_parallel import _get_submodule_by_name
 from vllm_omni.diffusion.mixfusion.execution_plan import expand_per_chunk
 from vllm_omni.diffusion.mixfusion.plan import (
     ChunkedOutput,
@@ -351,33 +351,9 @@ def _spec_entry(spec):
         raise TypeError(f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})") from None
 
 
-def _find_plan_modules(module: nn.Module, name: str) -> list[nn.Module]:
-    """Resolve dotted/wildcard plan targets, skipping PP-omitted layers."""
-    if isinstance(module, PPMissingLayer):
-        return []
-    if name == "":
-        return [module]
-
-    first_atom, remaining_name = name.split(".", 1) if "." in name else (name, "")
-    if first_atom == "*":
-        if not isinstance(module, nn.ModuleList):
-            raise ValueError("Wildcard '*' can only be used with ModuleList")
-        submodules: list[nn.Module] = []
-        for submodule in module:
-            if isinstance(submodule, PPMissingLayer):
-                continue
-            submodules.extend(_find_plan_modules(submodule, remaining_name))
-        return submodules
-
-    if hasattr(module, first_atom):
-        return _find_plan_modules(getattr(module, first_atom), remaining_name)
-    raise ValueError(f"'{first_atom}' is not a submodule of '{module.__class__.__name__}'")
-
-
 def _plan_modules(module: nn.Module, name: str) -> list[nn.Module]:
-    if name.count("*") > 1:
-        raise ValueError("Wildcard '*' can only be used once in the name")
-    return _find_plan_modules(module, name)
+    submodule = _get_submodule_by_name(module, name, skip_pp_missing=True)
+    return submodule if isinstance(submodule, list) else [submodule]
 
 
 def apply_mixfusion(module: nn.Module, plan: dict, adapter=None) -> None:

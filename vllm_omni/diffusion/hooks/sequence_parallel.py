@@ -631,13 +631,19 @@ class SequenceParallelGatherHook(ModelHook):
         return output[0] if is_tensor else type(output)(output)
 
 
-def _get_submodule_by_name(model: nn.Module, name: str) -> nn.Module | list[nn.Module]:
+def _get_submodule_by_name(
+    model: nn.Module,
+    name: str,
+    *,
+    skip_pp_missing: bool = False,
+) -> nn.Module | list[nn.Module]:
     """Get a submodule by dotted name, supporting wildcards.
 
     Args:
         model: The root module.
         name: Dotted path to submodule. Use "*" to match all children
             of a ModuleList.
+        skip_pp_missing: When True, omit ``PPMissingLayer`` placeholders.
 
     Returns:
         The submodule or list of submodules if wildcard used.
@@ -647,11 +653,21 @@ def _get_submodule_by_name(model: nn.Module, name: str) -> nn.Module | list[nn.M
     """
     if name.count("*") > 1:
         raise ValueError("Wildcard '*' can only be used once in the name")
-    return _find_submodule_by_name(model, name)
+    return _find_submodule_by_name(model, name, skip_pp_missing=skip_pp_missing)
 
 
-def _find_submodule_by_name(model: nn.Module, name: str) -> nn.Module | list[nn.Module]:
+def _find_submodule_by_name(
+    model: nn.Module,
+    name: str,
+    *,
+    skip_pp_missing: bool = False,
+) -> nn.Module | list[nn.Module]:
     """Recursive helper for _get_submodule_by_name."""
+    if skip_pp_missing:
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        if isinstance(model, PPMissingLayer):
+            return []
     if name == "":
         return model
 
@@ -662,7 +678,7 @@ def _find_submodule_by_name(model: nn.Module, name: str) -> nn.Module | list[nn.
             raise ValueError("Wildcard '*' can only be used with ModuleList")
         submodules = []
         for submodule in model:
-            subsubmodules = _find_submodule_by_name(submodule, remaining_name)
+            subsubmodules = _find_submodule_by_name(submodule, remaining_name, skip_pp_missing=skip_pp_missing)
             if not isinstance(subsubmodules, list):
                 subsubmodules = [subsubmodules]
             submodules.extend(subsubmodules)
@@ -670,7 +686,7 @@ def _find_submodule_by_name(model: nn.Module, name: str) -> nn.Module | list[nn.
     else:
         if hasattr(model, first_atom):
             submodule = getattr(model, first_atom)
-            return _find_submodule_by_name(submodule, remaining_name)
+            return _find_submodule_by_name(submodule, remaining_name, skip_pp_missing=skip_pp_missing)
         else:
             raise ValueError(f"'{first_atom}' is not a submodule of '{model.__class__.__name__}'")
 

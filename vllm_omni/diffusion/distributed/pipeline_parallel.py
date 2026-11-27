@@ -191,6 +191,13 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
     def _pp_send_work(self, work: list[Any]) -> None:
         self._pp_send_work_list = work
 
+    @property
+    def _step_pp_async(self) -> bool:
+        return bool(
+            getattr(getattr(self, "od_config", None), "step_execution", False)
+            and getattr(self, "supports_step_pipeline_parallel", False)
+        )
+
     def _prune_pp_send_work(self) -> None:
         self._pp_send_work = [work for work in self._pp_send_work if not work.is_completed()]
 
@@ -245,10 +252,7 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
 
         CFGParallelMixin._set_transformer_do_true_cfg(self, do_true_cfg)
 
-        step_pp_async = bool(
-            getattr(getattr(self, "od_config", None), "step_execution", False)
-            and getattr(self, "supports_step_pipeline_parallel", False)
-        )
+        step_pp_async = self._step_pp_async
         if not step_pp_async:
             self._sync_pp_send()
 
@@ -281,9 +285,7 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 result = self._predict_noise_for_cfg_branch(branch, predict_kwargs)
                 if step_pp_async:
                     self._prune_pp_send_work()
-                    send_work = pp_group.isend_tensor_dict_nonblocking_metadata(result.tensors)
-                else:
-                    send_work = pp_group.isend_tensor_dict(result.tensors)
+                send_work = pp_group.isend_tensor_dict(result.tensors, nonblocking_metadata=step_pp_async)
                 self._pp_send_work.extend(send_work)
             return None
 
@@ -351,10 +353,7 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             )
 
         pp_group = get_pp_group()
-        step_pp_async = bool(
-            getattr(getattr(self, "od_config", None), "step_execution", False)
-            and getattr(self, "supports_step_pipeline_parallel", False)
-        )
+        step_pp_async = self._step_pp_async
         if pp_group.is_last_rank:
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator

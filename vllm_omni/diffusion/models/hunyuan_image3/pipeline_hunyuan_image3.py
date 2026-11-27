@@ -1914,108 +1914,140 @@ class HunyuanImage3Pipeline(
         )
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
-        paged_kv_cached_prefix_len = 0
         if intermediate_tensors is not None:
             if mode != "gen_image":
                 raise ValueError("HunyuanImage3 PP currently supports the DiT gen_image path only.")
             if not isinstance(images, torch.Tensor):
                 raise ValueError("HunyuanImage3 PP requires batched tensor latents on non-first stages.")
-            input_ids = inputs_embeds = None
-            return_dict = True
             token_h = images.shape[-2] // self.hf_config.patch_size
             token_w = images.shape[-1] // self.hf_config.patch_size
-        else:
-            if input_ids is not None:
-                inputs_embeds = self.model.embed_tokens(input_ids)
-                bsz, seq_len, n_embd = inputs_embeds.shape
-            else:
-                inputs_embeds = None
-                bsz = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
-                seq_len = 0
-                n_embd = self.config.hidden_size
+            from vllm.forward_context import set_forward_context
 
-            # Instantiate placeholder tokens: <timestep>, <img> for the gen image
-            if mode == "gen_text":
-                # For gen_text, make sure gen_timestep_scatter_index is None
-                gen_timestep_scatter_index = None
-                token_h, token_w = None, None
-            elif uncond_cfg_prefill:
-                token_h, token_w = None, None
-            else:
-                if first_step:
-                    assert inputs_embeds is not None
-                    inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
-                        inputs_embeds, images, timestep, image_mask
-                    )
-                    inputs_embeds = self.instantiate_timestep_tokens(
-                        inputs_embeds, timestep, gen_timestep_scatter_index
-                    )
-                    # Instantiate guidance and timestep_r tokens for distilled models
-                    inputs_embeds = self.instantiate_guidance_tokens(inputs_embeds, guidance, guidance_scatter_index)
-                    inputs_embeds = self.instantiate_timestep_r_tokens(
-                        inputs_embeds, timesteps_r, timesteps_r_scatter_index
-                    )
-                else:
-                    t_emb = self.time_embed(timestep)
-                    image_emb, token_h, token_w = self.patch_embed(images, t_emb)
-                    timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
-                    extra_embeds = []
-                    if hasattr(self, "guidance_emb") and guidance is not None:
-                        guidance_emb = self.guidance_emb(guidance.reshape(-1)).reshape(bsz, -1, n_embd)
-                        extra_embeds.append(guidance_emb)
-                    if hasattr(self, "timestep_r_emb") and timesteps_r is not None:
-                        timesteps_r_emb = self.timestep_r_emb(timesteps_r.reshape(-1)).reshape(bsz, -1, n_embd)
-                        extra_embeds.append(timesteps_r_emb)
-                    inputs_embeds = torch.cat([timestep_emb, *extra_embeds, image_emb], dim=1)
+            with set_forward_context(None, self.vllm_config):
+                outputs = self.model(
+                    input_ids=None,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=None,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                    custom_pos_emb=custom_pos_emb,
+                    mode=mode,
+                    first_step=first_step,
+                    query_lens=query_lens,
+                    seq_lens=seq_lens,
+                    num_image_tokens=num_image_tokens,
+                    gen_timestep_scatter_index=gen_timestep_scatter_index,
+                    uncond_cfg_prefill=uncond_cfg_prefill,
+                    ar_kv_reuse_len=ar_kv_reuse_len,
+                    paged_kv_cached_prefix_len=0,
+                    full_attn_spans=full_attn_spans,
+                    intermediate_tensors=intermediate_tensors,
+                )
+            if isinstance(outputs, IntermediateTensors):
+                return outputs
+            diffusion_prediction = self.ragged_final_layer(
+                outputs[0], image_mask, timestep, token_h, token_w, first_step, num_special_tokens
+            )
+            return CausalMMOutputWithPast(
+                logits=None,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                diffusion_prediction=diffusion_prediction,
+            )
 
-            # Instantiate placeholder tokens: <timestep>, <img> for cond images
-            # Should only run once with kv-cache enabled.
-            if cond_vae_images is not None:
-                inputs_embeds, _, _ = self.instantiate_vae_image_tokens(
-                    inputs_embeds, cond_vae_images, cond_timestep, cond_vae_image_mask
-                )
-                inputs_embeds = self.instantiate_timestep_tokens(
-                    inputs_embeds, cond_timestep, cond_timestep_scatter_index
-                )
-            if cond_vit_images is not None:
-                inputs_embeds = self.instantiate_vit_image_tokens(
-                    inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs
-                )
-            assert inputs_embeds is not None
+        if input_ids is not None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
             bsz, seq_len, n_embd = inputs_embeds.shape
+        else:
+            inputs_embeds = None
+            bsz = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
+            seq_len = 0
+            n_embd = self.config.hidden_size
 
-            if first_step and self._uses_scheduler_paged_kv():
-                if not is_forward_context_available():
-                    raise RuntimeError("Hunyuan paged prefix execution requires an Omni ForwardContext")
-                paged_kv_cached_prefix_len = int(get_forward_context().paged_kv_cached_prefix_len)
-            if paged_kv_cached_prefix_len:
-                if ar_kv_reuse_len:
-                    raise ValueError("Hunyuan cannot combine imported AR KV and Scheduler prefix-cache hits")
-                (
-                    inputs_embeds,
-                    attention_mask,
-                    position_ids,
-                    custom_pos_emb,
-                    image_mask,
-                    gen_timestep_scatter_index,
-                    query_lens,
-                    seq_len,
-                ) = self._slice_cached_prefix_inputs(
-                    inputs_embeds,
-                    attention_mask,
-                    position_ids,
-                    custom_pos_emb,
-                    image_mask,
-                    gen_timestep_scatter_index,
-                    query_lens,
-                    seq_lens,
-                    paged_kv_cached_prefix_len,
+        # Instantiate placeholder tokens: <timestep>, <img> for the gen image
+        if mode == "gen_text":
+            # For gen_text, make sure gen_timestep_scatter_index is None
+            gen_timestep_scatter_index = None
+            token_h, token_w = None, None
+        elif uncond_cfg_prefill:
+            token_h, token_w = None, None
+        else:
+            if first_step:
+                assert inputs_embeds is not None
+                inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
+                    inputs_embeds, images, timestep, image_mask
                 )
-                logger.debug(
-                    "Hunyuan prefix slice: cached_prefix_len=%d query_len=%d",
-                    paged_kv_cached_prefix_len,
-                    seq_len,
+                inputs_embeds = self.instantiate_timestep_tokens(inputs_embeds, timestep, gen_timestep_scatter_index)
+                # Instantiate guidance and timestep_r tokens for distilled models
+                inputs_embeds = self.instantiate_guidance_tokens(inputs_embeds, guidance, guidance_scatter_index)
+                inputs_embeds = self.instantiate_timestep_r_tokens(
+                    inputs_embeds, timesteps_r, timesteps_r_scatter_index
                 )
+            else:
+                t_emb = self.time_embed(timestep)
+                image_emb, token_h, token_w = self.patch_embed(images, t_emb)
+                timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
+                extra_embeds = []
+                if hasattr(self, "guidance_emb") and guidance is not None:
+                    guidance_emb = self.guidance_emb(guidance.reshape(-1)).reshape(bsz, -1, n_embd)
+                    extra_embeds.append(guidance_emb)
+                if hasattr(self, "timestep_r_emb") and timesteps_r is not None:
+                    timesteps_r_emb = self.timestep_r_emb(timesteps_r.reshape(-1)).reshape(bsz, -1, n_embd)
+                    extra_embeds.append(timesteps_r_emb)
+                inputs_embeds = torch.cat([timestep_emb, *extra_embeds, image_emb], dim=1)
+
+        # Instantiate placeholder tokens: <timestep>, <img> for cond images
+        # Should only run once with kv-cache enabled.
+        if cond_vae_images is not None:
+            inputs_embeds, _, _ = self.instantiate_vae_image_tokens(
+                inputs_embeds, cond_vae_images, cond_timestep, cond_vae_image_mask
+            )
+            inputs_embeds = self.instantiate_timestep_tokens(inputs_embeds, cond_timestep, cond_timestep_scatter_index)
+        if cond_vit_images is not None:
+            inputs_embeds = self.instantiate_vit_image_tokens(
+                inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs
+            )
+        assert inputs_embeds is not None
+        bsz, seq_len, n_embd = inputs_embeds.shape
+
+        paged_kv_cached_prefix_len = 0
+        if first_step and self._uses_scheduler_paged_kv():
+            if not is_forward_context_available():
+                raise RuntimeError("Hunyuan paged prefix execution requires an Omni ForwardContext")
+            paged_kv_cached_prefix_len = int(get_forward_context().paged_kv_cached_prefix_len)
+        if paged_kv_cached_prefix_len:
+            if ar_kv_reuse_len:
+                raise ValueError("Hunyuan cannot combine imported AR KV and Scheduler prefix-cache hits")
+            (
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                custom_pos_emb,
+                image_mask,
+                gen_timestep_scatter_index,
+                query_lens,
+                seq_len,
+            ) = self._slice_cached_prefix_inputs(
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                custom_pos_emb,
+                image_mask,
+                gen_timestep_scatter_index,
+                query_lens,
+                seq_lens,
+                paged_kv_cached_prefix_len,
+            )
+            logger.debug(
+                "Hunyuan prefix slice: cached_prefix_len=%d query_len=%d",
+                paged_kv_cached_prefix_len,
+                seq_len,
+            )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         from vllm.forward_context import set_forward_context
@@ -2053,17 +2085,16 @@ class HunyuanImage3Pipeline(
             logits = self.lm_head(hidden_states)
             logits = logits.float()
             diffusion_prediction = None
-        elif uncond_cfg_prefill and intermediate_tensors is None:
+        elif uncond_cfg_prefill:
             logits = None
             diffusion_prediction = None
         else:
             logits = None
-            if inputs_embeds is not None:
-                hidden_states = hidden_states.to(inputs_embeds.device)
-                assert hidden_states.numel() == bsz * seq_len * n_embd, (
-                    f"Shape mismatch: {hidden_states.shape} cannot reshape to ({bsz}, {seq_len}, {n_embd})"
-                )
-                hidden_states = hidden_states.reshape(bsz, seq_len, n_embd)
+            hidden_states = hidden_states.to(inputs_embeds.device)
+            assert hidden_states.numel() == bsz * seq_len * n_embd, (
+                f"Shape mismatch: {hidden_states.shape} cannot reshape to ({bsz}, {seq_len}, {n_embd})"
+            )
+            hidden_states = hidden_states.reshape(bsz, seq_len, n_embd)
             diffusion_prediction = self.ragged_final_layer(
                 hidden_states, image_mask, timestep, token_h, token_w, first_step, num_special_tokens
             )

@@ -459,13 +459,17 @@ class GroupCoordinator:
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
         dst: int | None = None,
-    ) -> list[torch.distributed.Work]:
+        *,
+        nonblocking_metadata: bool = False,
+    ) -> list[Any]:
         """Non-blocking send of a tensor dictionary.
 
-        Sends metadata via the Gloo CPU group (blocking) then starts a
-        non-blocking NCCL isend for each GPU tensor.  Returns the list of
-        Work handles; the caller must call handle.wait() before the tensors
-        can be safely reused or freed.
+        Sends metadata via the Gloo CPU group (blocking by default, or
+        non-blocking when ``nonblocking_metadata=True``) then starts a
+        non-blocking isend for each tensor. Returns Work handles (or a
+        ``_PendingSend`` wrapper holding metadata buffers when
+        ``nonblocking_metadata=True``); the caller must call ``wait()`` before
+        the tensors can be safely reused or freed.
 
         NOTE: `dst` is the group rank of the destination.
         """
@@ -477,48 +481,31 @@ class GroupCoordinator:
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+        handles: list[Any] = []
+        buffers: list[torch.Tensor] = []
+        if nonblocking_metadata:
+            metadata_tensor = torch.frombuffer(pickle.dumps(metadata_list), dtype=torch.uint8)
+            size_tensor = torch.tensor([metadata_tensor.numel()], dtype=torch.long, device="cpu")
+            handles.extend(
+                [
+                    torch.distributed.isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group),
+                    torch.distributed.isend(metadata_tensor, dst=self.ranks[dst], group=self.cpu_group),
+                ]
+            )
+            buffers.extend([size_tensor, metadata_tensor])
+        else:
+            self.send_object(metadata_list, dst=dst)
 
-        handles: list[torch.distributed.Work] = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
             group = self.cpu_group if tensor.is_cpu else self.device_group
             handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)
-            if tensor.is_cuda:
-                # Keep allocator from reusing this CUDA buffer before the async send finishes.
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            handles.append(handle)
-        return handles
-
-    def isend_tensor_dict_nonblocking_metadata(
-        self,
-        tensor_dict: dict[str, torch.Tensor | Any],
-        dst: int | None = None,
-    ) -> list[Any]:
-        """Send tensor metadata and data without waiting for the receiver."""
-        if not torch.distributed.is_initialized() or self.world_size == 1:
-            return []
-        if dst is None:
-            dst = self.group_next_rank
-        assert dst < self.world_size, f"Invalid dst rank ({dst})"
-
-        metadata, tensors = _split_tensor_dict(tensor_dict)
-        metadata_tensor = torch.frombuffer(pickle.dumps(metadata), dtype=torch.uint8)
-        size_tensor = torch.tensor([metadata_tensor.numel()], dtype=torch.long, device="cpu")
-        handles = [
-            torch.distributed.isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group),
-            torch.distributed.isend(metadata_tensor, dst=self.ranks[dst], group=self.cpu_group),
-        ]
-        buffers = [size_tensor, metadata_tensor]
-        for tensor in tensors:
-            if tensor.numel() == 0:
-                continue
-            group = self.cpu_group if tensor.is_cpu else self.device_group
-            handles.append(torch.distributed.isend(tensor, dst=self.ranks[dst], group=group))
             if not tensor.is_cpu:
+                # Keep allocator from reusing this device buffer before the async send finishes.
                 tensor.record_stream(torch.accelerator.current_stream(tensor.device))
-        return [_PendingSend(handles, tuple(buffers))]
+            handles.append(handle)
+        return [_PendingSend(handles, tuple(buffers))] if nonblocking_metadata else handles
 
     def isend_tensor(
         self,

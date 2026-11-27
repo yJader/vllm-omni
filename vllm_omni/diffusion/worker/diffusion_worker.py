@@ -2138,12 +2138,7 @@ class WorkerProc:
         return [s for s in statuses if s is not None]
 
     def _is_stage_leader(self) -> bool:
-        """Check if this worker is the leader of its PP stage.
-
-        PP stage leader is defined as: tp=0, sp=0, cfg=0, dp=0.
-        PP configuration validation already requires dp=1, so we only
-        need to check the other dimensions.
-        """
+        """Check if this worker is the leader of its PP stage (tp=sp=cfg=dp=0)."""
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
         from vllm_omni.diffusion.distributed.parallel_state import (
@@ -2215,20 +2210,16 @@ class WorkerProc:
                 reply = RpcReply(rpc_id=reply_roles["result"], result=result)
                 batch_outputs = result.runner_outputs if isinstance(result, BatchRunnerOutput) else ()
                 is_all_terminal = bool(batch_outputs) and all(item.finished for item in batch_outputs)
-                is_non_terminal_step = (
-                    is_last_stage_leader
-                    and bool(batch_outputs)
-                    and all(not item.finished and item.result is None for item in batch_outputs)
+                is_non_terminal_step = bool(batch_outputs) and all(
+                    not item.finished and item.result is None for item in batch_outputs
                 )
+                deferred_job: tuple[RpcReply, str, Any] | None = None
                 if self._async_output_queue is not None and not self.od_config.streaming_output and is_all_terminal:
                     # Terminal states have been retired by the runner, so their
                     # output tensors cannot be reused by the next input batch.
                     # Streaming/mixed batches keep synchronous transport because
                     # their live states may still own mutable output storage.
-                    gpu_event = current_omni_platform.record_device_event()
-                    with self._async_output_done:
-                        self._async_output_pending += 1
-                    self._async_output_queue.put((reply, reply.rpc_id, gpu_event))
+                    deferred_job = (reply, reply.rpc_id, current_omni_platform.record_device_event())
                 elif self._async_output_queue is not None and is_non_terminal_step:
                     # Non-terminal steps carry no output tensors to pack, but
                     # their GPU forward and latent send are asynchronous. Wait
@@ -2237,13 +2228,15 @@ class WorkerProc:
                     # before this stage completes device execution.
                     step_event = self._record_nonblocking_step_event()
                     if step_event is not None:
-                        with self._async_output_done:
-                            self._async_output_pending += 1
-                        self._async_output_queue.put((reply, reply.rpc_id, _PendingStepEvent(step_event)))
-                    else:
-                        self._enqueue_result(reply)
+                        deferred_job = (reply, reply.rpc_id, _PendingStepEvent(step_event))
+
+                if deferred_job is not None:
+                    assert self._async_output_queue is not None
+                    with self._async_output_done:
+                        self._async_output_pending += 1
+                    self._async_output_queue.put(deferred_job)
                 else:
-                    if isinstance(result, BaseRunnerOutput):
+                    if isinstance(result, BaseRunnerOutput) and not is_non_terminal_step:
                         pack_diffusion_output_shm(result)
                     self._enqueue_result(reply)
 
