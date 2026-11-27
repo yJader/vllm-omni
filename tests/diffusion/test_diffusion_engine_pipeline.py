@@ -637,3 +637,138 @@ async def test_completion_between_retire_scan_and_wait_does_not_hang(fail_pp0):
     finally:
         allow_wait_phase.set()
         _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_queued_abort_before_final_retirement_wins_over_completion():
+    engine = _make_engine(asyncio.get_running_loop())
+    engine.od_config.max_num_seqs = 2
+    engine.scheduler.max_num_running_reqs = 2
+    engine.scheduler.max_num_resident_reqs = 4
+
+    for rid in ("a", "b"):
+        engine.add_request(
+            OmniDiffusionRequest(
+                request_id=rid,
+                prompt="test",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            )
+        )
+    stream_a = engine._out_streams["a"]
+    stream_b = engine._out_streams["b"]
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        sched_0, pp0_0, step_0 = engine.executor.batches[0]
+        assert sched_0.scheduled_request_ids == ["a", "b"]
+
+        # Hold the condition lock so abort and final step completion become visible
+        # together before the busy loop enters Phase 1 retirement.
+        with engine._cv:
+            engine.abort("a")
+            pp0_0.set_result(None)
+            step_0.set_result(
+                BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            request_id="a", step_index=1, finished=True, result=DiffusionOutput(finished=True)
+                        ),
+                        RunnerOutput(
+                            request_id="b", step_index=1, finished=True, result=DiffusionOutput(finished=True)
+                        ),
+                    ]
+                )
+            )
+
+        out_a = await asyncio.wait_for(stream_a.get(), timeout=1)
+        out_b = await asyncio.wait_for(stream_b.get(), timeout=1)
+        assert out_a.aborted is True
+        assert out_a.finished is True
+        assert out_b.aborted is False
+        assert out_b.finished is True
+
+        # Aborting after terminal commit must not duplicate output delivery.
+        engine.abort("b")
+        await asyncio.sleep(0.03)
+        assert stream_a.empty()
+        assert stream_b.empty()
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_abort_defers_inflight_before_kv_drain_reentry():
+    engine = _make_engine(asyncio.get_running_loop(), max_concurrent_batches=1)
+    output_a = _add_request(engine, "a")
+    output_c = _add_request(engine, "c")
+    reentered = False
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        _, pp0_a, step_a = engine.executor.batches[0]
+        pp0_a.set_result(None)
+        step_a.set_result(_step_output("a"))
+
+        orig_poll = engine._poll_native_kv
+
+        def reentrant_poll(*, drain_request_ids=None):
+            nonlocal reentered
+            if drain_request_ids and not reentered:
+                reentered = True
+                engine._retire_ready_results()
+            return orig_poll(drain_request_ids=drain_request_ids)
+
+        engine._poll_native_kv = reentrant_poll  # type: ignore[method-assign]
+        with engine._cv:
+            engine._abort_requests(["a", "c"])
+
+        assert reentered
+        out_a = await asyncio.wait_for(output_a.get(), timeout=1)
+        out_c = await asyncio.wait_for(output_c.get(), timeout=1)
+        assert out_a.aborted is True
+        assert out_c.aborted is True
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_public_pause_and_resume_scheduler_for_step_pp():
+    engine = _make_engine(asyncio.get_running_loop())
+    output_a = _add_request(engine, "a")
+    try:
+        await _wait_until(lambda: len(engine.executor.batches) == 1)
+        _, pp0_a, step_a = engine.executor.batches[0]
+        pp0_a.set_result(None)
+
+        pause_task = asyncio.create_task(engine.async_collective_rpc("pause_scheduler", kwargs={"mode": "keep"}))
+        await asyncio.sleep(0.03)
+        assert not pause_task.done()
+        assert engine.executor.rpc_calls == []
+
+        output_b = _add_request(engine, "b")
+        await asyncio.sleep(0.03)
+        assert len(engine.executor.batches) == 1
+
+        step_a.set_result(_step_output("a"))
+        assert await asyncio.wait_for(pause_task, timeout=1) is None
+        assert engine.executor.rpc_calls == ["synchronize_device"]
+        assert (await asyncio.wait_for(output_a.get(), timeout=1)).finished is True
+        assert len(engine.executor.batches) == 1
+
+        assert await asyncio.wait_for(engine.async_collective_rpc("resume_scheduler"), timeout=1) is None
+        await _wait_until(lambda: len(engine.executor.batches) == 2)
+        _, pp0_b, step_b = engine.executor.batches[1]
+        pp0_b.set_result(None)
+        step_b.set_result(_step_output("b"))
+        assert (await asyncio.wait_for(output_b.get(), timeout=1)).finished is True
+    finally:
+        _stop_engine(engine)
+
+
+def test_pause_scheduler_validation_rejects_sync_step_and_unknown_mode():
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    engine._pipeline_async_enabled = False
+
+    with pytest.raises(ValueError, match="mode='keep'"):
+        engine._check_pause_request({"mode": "drop"})
+    with pytest.raises(NotImplementedError, match="asynchronous Step-PP"):
+        engine._check_pause_request({"mode": "keep"})

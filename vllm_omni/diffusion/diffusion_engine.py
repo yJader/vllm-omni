@@ -1022,11 +1022,16 @@ class DiffusionEngine:
                 sched_output, futures = self._pending_batches[0]
                 if not futures.step_done.done():
                     return
-                self._pending_batches.popleft()
-                request_ids = sched_output.scheduled_request_ids
-                deferred_aborts = self._deferred_pipeline_aborts.intersection(request_ids)
                 runner_output = futures.step_done.result()
                 with self._cv:
+                    # Inspect queued aborts before popping the head so aborts
+                    # enqueued before terminal commit still win over completion.
+                    abort_ids = self._take_abort_ids_locked()
+                    for request_id in self._defer_inflight_aborts_locked(abort_ids):
+                        self.abort_queue.put(request_id)
+                    self._pending_batches.popleft()
+                    request_ids = sched_output.scheduled_request_ids
+                    deferred_aborts = self._deferred_pipeline_aborts.intersection(request_ids)
                     if deferred_aborts:
                         self.scheduler.finish_requests(list(deferred_aborts), DiffusionRequestStatus.FINISHED_ABORTED)
                         self._deferred_pipeline_aborts.difference_update(deferred_aborts)
@@ -1513,8 +1518,10 @@ class DiffusionEngine:
         mode = (kwargs or {}).get("mode")
         if mode != "keep":
             raise ValueError(f"DiffusionEngine pause supports mode='keep' only, got {mode!r}.")
-        if self.execution_mode != DiffusionExecutionMode.REQUEST_BATCH:
-            raise NotImplementedError("DiffusionEngine pause supports request-level execution only.")
+        if self.execution_mode != DiffusionExecutionMode.REQUEST_BATCH and not self._pipeline_async_enabled:
+            raise NotImplementedError(
+                "DiffusionEngine pause supports request-level execution and asynchronous Step-PP only."
+            )
 
     def _run_pause_barrier(self, timeout: float | None, *, deadline: float | None = None) -> None:
         """Return once every worker has finished the device work of the batch that ran."""
@@ -2615,37 +2622,53 @@ class DiffusionEngine:
                 self._fail_engine(exc)
                 raise
 
-    def _drain_abort_queue(self) -> None:
+    def _take_abort_ids_locked(self) -> list[str]:
         if self.abort_queue.empty():
-            return
+            return []
 
         request_ids: list[str] = []
         while not self.abort_queue.empty():
             ids = self.abort_queue.get_nowait()
             request_ids.extend((ids,) if isinstance(ids, str) else ids)
+        return list(dict.fromkeys(request_ids))
 
+    def _defer_inflight_aborts_locked(self, request_ids: Iterable[str]) -> list[str]:
+        request_ids_list = list(dict.fromkeys(request_ids))
+        if not getattr(self, "_pipeline_async_enabled", False) or not request_ids_list:
+            return request_ids_list
+
+        in_flight_ids = {
+            request_id for sched_output, _ in self._pending_batches for request_id in sched_output.scheduled_request_ids
+        }
+        deferred_ids = set(request_ids_list).intersection(in_flight_ids)
+        if deferred_ids:
+            self._deferred_pipeline_aborts.update(deferred_ids)
+            self._cancel_request_chunk_states_locked(deferred_ids)
+            if self._streaming_playback is not None:
+                for request_id in deferred_ids:
+                    self._streaming_playback.pop(request_id, None)
+        return [request_id for request_id in request_ids_list if request_id not in deferred_ids]
+
+    def _drain_abort_queue(self) -> None:
+        request_ids = self._take_abort_ids_locked()
+        if not request_ids:
+            return
         self._abort_requests(request_ids)
 
     def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         request_ids = list(dict.fromkeys(request_ids))
 
+        # Record in-flight PP aborts before any KV drain that could re-enter
+        # _retire_ready_results() and commit terminal completion.
+        request_ids = self._defer_inflight_aborts_locked(request_ids)
+        if not request_ids:
+            return
+
         # Drop late chunks before any further executor wait so a chunk that
         # arrives during KV drain is not delivered as success.
         self._cancel_request_chunk_states_locked(request_ids)
         self._poll_native_kv(drain_request_ids=request_ids)
-        if self._pipeline_async_enabled:
-            in_flight_ids = {
-                request_id
-                for sched_output, _ in self._pending_batches
-                for request_id in sched_output.scheduled_request_ids
-            }
-            deferred_ids = set(request_ids).intersection(in_flight_ids)
-            self._deferred_pipeline_aborts.update(deferred_ids)
-            for request_id in deferred_ids:
-                if self._streaming_playback is not None:
-                    self._streaming_playback.pop(request_id, None)
-            request_ids = [request_id for request_id in request_ids if request_id not in deferred_ids]
         for request_id in request_ids:
             if self._streaming_playback is not None:
                 self._streaming_playback.pop(request_id, None)
