@@ -2169,13 +2169,10 @@ class WorkerProc:
         """
         if not torch.accelerator.is_available():
             return None
-        try:
-            event = torch.Event()
-            event.record()
-            return event
-        except Exception:
-            logger.warning("Failed to record non-blocking PP step event; replying immediately")
-            return None
+
+        event = torch.Event()
+        event.record()
+        return event
 
     def _execute_role_rpc(self, rpc_request: dict) -> None:
         """Execute a role-based RPC and send independent replies per role.

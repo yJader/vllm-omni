@@ -142,6 +142,24 @@ def test_deferred_step_event_failure_completes_result_role_with_error(monkeypatc
     assert proc.drain_async_outputs(timeout=0)
 
 
+def test_non_terminal_step_event_record_failure_sends_error_reply(monkeypatch):
+    proc, _ = _worker(monkeypatch, iter([_output("q0", finished=False)]))
+    failing_event = MagicMock()
+    failing_event.record.side_effect = RuntimeError("event record failed")
+    worker_module.torch.Event.return_value = failing_event
+
+    _rpc(proc, "r0")
+
+    replies = [proc.result_mq.get_nowait(), proc.result_mq.get_nowait()]
+    assert proc.result_mq.empty()
+    assert {reply.rpc_id for reply in replies} == {"e", "r0"}
+    for reply in replies:
+        assert isinstance(reply, RpcReply)
+        assert reply.result is None
+        assert reply.error and "event record failed" in reply.error
+    assert proc._async_output_queue.empty()
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_terminal_pack_does_not_block_next_step_and_preserves_output(monkeypatch, dtype):
     monkeypatch.setattr(diffusion_ipc, "_SHM_TENSOR_THRESHOLD", 1)

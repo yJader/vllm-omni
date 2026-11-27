@@ -857,7 +857,12 @@ class DiffusionEngine:
 
             if self._pipeline_async_enabled:
                 # PP async: submit and loop back immediately
-                self._submit_pipeline_batch(sched_output)
+                try:
+                    self._submit_pipeline_batch(sched_output)
+                except Exception as exc:
+                    self._fail_engine(exc)
+                    return
+                continue
             else:
                 # Sync execution
                 try:

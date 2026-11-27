@@ -30,6 +30,7 @@ class _PipelineExecutor:
     def __init__(self) -> None:
         self.batches: list[tuple[object, concurrent.futures.Future, concurrent.futures.Future]] = []
         self.rpc_calls: list[str] = []
+        self.shutdown_calls: int = 0
 
     def submit_step(self, sched_output) -> PipelineStepFutures:
         pp0_done: concurrent.futures.Future[None] = concurrent.futures.Future()
@@ -42,6 +43,7 @@ class _PipelineExecutor:
         return [None]
 
     def shutdown(self) -> None:
+        self.shutdown_calls += 1
         return None
 
 
@@ -86,6 +88,8 @@ def _make_engine(loop: asyncio.AbstractEventLoop, *, max_concurrent_batches: int
     engine._request_cancellations = None
     engine.main_loop = loop
     engine.stop_event = threading.Event()
+    engine._loop_started = True
+    engine._init_lock = asyncio.Lock()
     engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
     engine.worker_thread.start()
     return engine
@@ -559,3 +563,77 @@ def test_non_step_pp_modes_keep_sync_executor_path(monkeypatch, execution_mode, 
     assert engine._pipeline_async_enabled is False
     assert engine.scheduler.step_pp_enabled is False
     assert engine.execute_fn.__name__ == expected_execute_method
+
+
+@pytest.mark.asyncio
+async def test_submit_step_failure_fails_engine_and_propagates_to_request_and_rpc():
+    engine = _make_engine(asyncio.get_running_loop())
+    before_submit = threading.Event()
+    allow_submit = threading.Event()
+    submit_error = RuntimeError("broadcast enqueue failed")
+
+    def gated_prepare(_sched_output):
+        before_submit.set()
+        assert allow_submit.wait(2)
+
+    def failing_submit(_sched_output):
+        raise submit_error
+
+    engine._prepare_kv_for_forward = gated_prepare  # type: ignore[method-assign]
+    engine.executor.submit_step = failing_submit  # type: ignore[method-assign]
+    output = _add_request(engine, "a")
+    try:
+        assert await asyncio.to_thread(before_submit.wait, 2)
+        rpc_task = asyncio.create_task(engine.async_collective_rpc("update_weights"))
+        await _wait_until(lambda: not engine._rpc_queue.empty())
+        allow_submit.set()
+
+        await _wait_until(lambda: not engine.worker_thread.is_alive())
+        assert (await asyncio.wait_for(output.get(), timeout=1)).error == str(submit_error)
+        with pytest.raises(RuntimeError, match="broadcast enqueue failed"):
+            await asyncio.wait_for(rpc_task, timeout=1)
+        assert engine.executor.shutdown_calls == 1
+    finally:
+        allow_submit.set()
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_pp0", [False, True])
+async def test_completion_between_retire_scan_and_wait_does_not_hang(fail_pp0):
+    engine = _make_engine(asyncio.get_running_loop(), max_concurrent_batches=1)
+    scan_saw_pending = threading.Event()
+    allow_wait_phase = threading.Event()
+    orig_retire = engine._retire_ready_results
+    armed = False
+
+    def gated_retire():
+        nonlocal armed
+        orig_retire()
+        if not armed and engine._pending_batches:
+            armed = True
+            scan_saw_pending.set()
+            assert allow_wait_phase.wait(2)
+
+    engine._retire_ready_results = gated_retire  # type: ignore[method-assign]
+    output = _add_request(engine, "a")
+    try:
+        assert await asyncio.to_thread(scan_saw_pending.wait, 2)
+        _, pp0_done, step_done = engine.executor.batches[0]
+        if fail_pp0:
+            pp0_done.set_exception(RuntimeError("pp0 crashed before wait"))
+        else:
+            pp0_done.set_result(None)
+            step_done.set_result(_step_output("a"))
+        allow_wait_phase.set()
+
+        result = await asyncio.wait_for(output.get(), timeout=1)
+        if fail_pp0:
+            assert result.error == "pp0 crashed before wait"
+            await _wait_until(lambda: not engine.worker_thread.is_alive())
+        else:
+            assert result.finished is True
+            assert result.error is None
+    finally:
+        allow_wait_phase.set()
+        _stop_engine(engine)
