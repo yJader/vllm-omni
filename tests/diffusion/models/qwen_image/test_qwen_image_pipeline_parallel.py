@@ -420,3 +420,20 @@ def test_pipeline_parallel_predict_noise_preserves_mixfusion_list_and_cfg_branch
     assert isinstance(got_cfg, list) and len(got_cfg) == 2
     torch.testing.assert_close(got_cfg[0], torch.full((1, 2, 4), 3.0))
     torch.testing.assert_close(got_cfg[1], torch.full((1, 4, 4), 5.0))
+
+
+@pytest.mark.parametrize(
+    ("module_path", "class_name"),
+    [
+        ("vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit", "QwenImageEditPipeline"),
+        ("vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus", "QwenImageEditPlusPipeline"),
+        ("vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered", "QwenImageLayeredPipeline"),
+    ],
+)
+def test_qwen_edit_variants_reject_pipeline_parallelism(module_path, class_name):
+    import importlib
+
+    pipeline_cls = getattr(importlib.import_module(module_path), class_name)
+    od_config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=2))
+    with pytest.raises(ValueError, match=f"{class_name} does not support pipeline parallelism"):
+        pipeline_cls(od_config=od_config)

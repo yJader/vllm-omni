@@ -219,6 +219,8 @@ class QwenImageLayeredPipeline(
         prefix: str = "",
     ):
         super().__init__()
+        if od_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(f"{type(self).__name__} does not support pipeline parallelism.")
         self.od_config = od_config
         self.device = get_local_device()
         model = od_config.model
